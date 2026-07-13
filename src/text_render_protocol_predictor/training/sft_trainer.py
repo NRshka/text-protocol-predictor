@@ -88,6 +88,7 @@ def train_sft(
     from accelerate import Accelerator
     from accelerate.utils import set_seed
     from omegaconf import OmegaConf
+    from tqdm.auto import tqdm
     from transformers import get_scheduler
 
     accelerator = Accelerator(
@@ -151,6 +152,17 @@ def train_sft(
     if cfg.training.resume_from:
         state = _load_checkpoint(accelerator, Path(cfg.training.resume_from))
 
+    progress = tqdm(
+        total=int(cfg.training.max_steps),
+        initial=state.global_step,
+        desc="SFT",
+        unit="step",
+        dynamic_ncols=True,
+        disable=(
+            not bool(cfg.training.progress_bar)
+            or not accelerator.is_local_main_process
+        ),
+    )
     model.train()
     optimizer.zero_grad(set_to_none=True)
     while state.global_step < int(cfg.training.max_steps):
@@ -175,10 +187,18 @@ def train_sft(
                 continue
             state.global_step += 1
             mean_loss = accelerator.gather(loss.detach()).float().mean().item()
+            learning_rate = scheduler.get_last_lr()[0]
+            progress.update(1)
+            progress.set_postfix(
+                epoch=state.epoch + 1,
+                loss=f"{mean_loss:.4f}",
+                lr=f"{learning_rate:.3e}",
+                refresh=True,
+            )
             accelerator.log(
                 {
                     "train/loss": mean_loss,
-                    "train/learning_rate": scheduler.get_last_lr()[0],
+                    "train/learning_rate": learning_rate,
                     "train/epoch": state.epoch,
                 },
                 step=state.global_step,
@@ -199,5 +219,6 @@ def train_sft(
         break
 
     _save_checkpoint(accelerator, model, processor, state, output_dir, resolved_config)
+    progress.close()
     accelerator.end_training()
     return state

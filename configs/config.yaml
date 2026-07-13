@@ -50,6 +50,7 @@ training:
   max_steps: 10000
   eval_steps: 250
   save_steps: 250
+  progress_bar: true
   output_dir: outputs/sft
   resume_from: null
 
