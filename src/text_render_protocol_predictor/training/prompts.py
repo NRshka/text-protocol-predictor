@@ -31,12 +31,16 @@ class ProtocolPromptTemplate:
         height: int,
         target: str | None = None,
     ) -> list[dict[str, Any]]:
+        # Transformers image processors accept local paths as strings, but do
+        # not accept pathlib.Path objects. Keep this conversion at the prompt
+        # boundary so dataset records can retain strongly typed paths.
+        processor_image = str(image) if isinstance(image, Path) else image
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": self.system},
             {
                 "role": "user",
                 "content": [
-                    {"type": "image", "image": image},
+                    {"type": "image", "image": processor_image},
                     {"type": "text", "text": self.user_text(width, height)},
                 ],
             },
@@ -46,4 +50,3 @@ class ProtocolPromptTemplate:
                 {"role": "assistant", "content": [{"type": "text", "text": target}]}
             )
         return messages
-
