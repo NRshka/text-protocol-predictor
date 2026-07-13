@@ -9,12 +9,26 @@ from text_render_protocol_predictor.training import ProtocolPromptTemplate, Prot
 
 class FakeProcessor:
     def apply_chat_template(self, conversations, **kwargs):
+        if not kwargs["tokenize"]:
+            texts = []
+            for conversation in conversations:
+                if conversation[-1]["role"] == "assistant":
+                    target = conversation[-1]["content"][0]["text"]
+                    texts.append("AB" + target)
+                else:
+                    texts.append("AB")
+            return texts
+
+        assert "padding" not in kwargs
+        assert "return_assistant_tokens_mask" not in kwargs
+        assert kwargs["processor_kwargs"] == {"padding": True}
         batch_size = len(conversations)
-        input_ids = torch.tensor([[10, 11, 12, 13]] * batch_size)
+        has_assistant = conversations[0][-1]["role"] == "assistant"
+        token_row = [10, 11, 12, 13] if has_assistant else [10, 11]
+        input_ids = torch.tensor([token_row] * batch_size)
         return {
             "input_ids": input_ids,
             "attention_mask": torch.ones_like(input_ids),
-            "assistant_masks": torch.tensor([[0, 0, 1, 1]] * batch_size),
         }
 
 
@@ -28,7 +42,6 @@ def test_collator_masks_everything_except_assistant() -> None:
     collator = ProtocolSFTCollator(FakeProcessor(), ProtocolPromptTemplate())
     batch = collator([record])
     assert batch["labels"].tolist() == [[-100, -100, 12, 13]]
-    assert "assistant_masks" not in batch
 
 
 def test_collator_rejects_overlength_without_truncation() -> None:
