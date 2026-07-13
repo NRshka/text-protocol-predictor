@@ -1,0 +1,64 @@
+defaults:
+  - _self_
+
+dataset:
+  root_dir: ???
+  manifests:
+    train: train.jsonl
+    validation: validation.jsonl
+    test: test.jsonl
+  font_registry: null
+  verify_image_dimensions: true
+  num_workers: 8
+  preflight_validation: true
+
+protocol:
+  version: "1.0"
+  canonicalizer_version: "1.0.0"
+  decimal_places: 3
+  unicode_normalization: NFC
+  max_objects: 64
+
+model:
+  name_or_path: Qwen/Qwen3-VL-8B-Instruct
+  precision: bf16
+  max_output_tokens: 4096
+  max_sequence_tokens: 16384
+  image_min_pixels: 200704
+  image_max_pixels: 1003520
+  gradient_checkpointing: true
+  attn_implementation: sdpa
+  freeze_vision_tower: true
+  freeze_multimodal_projector: true
+
+lora:
+  enabled: true
+  rank: 128
+  alpha: 256
+  dropout: 0.05
+  target_scope: language_decoder
+
+training:
+  seed: 2026
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 8
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.03
+  scheduler: cosine
+  gradient_clip_norm: 1.0
+  max_steps: 10000
+  eval_steps: 250
+  save_steps: 250
+  output_dir: outputs/sft
+  resume_from: null
+
+evaluation:
+  per_device_batch_size: 1
+
+tracking:
+  provider: wandb
+  project: text-render-protocol-predictor
+  entity: null
+  run_name: null
+  mode: online

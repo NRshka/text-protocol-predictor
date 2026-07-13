@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "text-render-protocol-predictor"
+version = "0.1.0"
+description = "Training pipeline for predicting editable text-rendering protocols"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "accelerate>=1.12",
+    "hydra-core>=1.3.2",
+    "peft>=0.18",
+    "pillow>=11",
+    "pydantic>=2.12,<3",
+    "torch>=2.10",
+    "transformers>=5.0",
+    "wandb>=0.23",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9",
+    "pytest-cov>=7",
+    "ruff>=0.14",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/text_render_protocol_predictor"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
