@@ -1,5 +1,4 @@
-from .collator import ProtocolSFTCollator
+from .collator import ProtocolGenerationCollator, ProtocolSFTCollator
 from .prompts import ProtocolPromptTemplate
 
-__all__ = ["ProtocolPromptTemplate", "ProtocolSFTCollator"]
-
+__all__ = ["ProtocolGenerationCollator", "ProtocolPromptTemplate", "ProtocolSFTCollator"]

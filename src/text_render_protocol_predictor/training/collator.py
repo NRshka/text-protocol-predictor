@@ -117,3 +117,31 @@ class ProtocolSFTCollator:
             labels.masked_fill_(~batch["attention_mask"].bool(), self.ignore_index)
         batch["labels"] = labels
         return dict(batch)
+
+
+@dataclass
+class ProtocolGenerationCollator:
+    """Build prompt-only batches while retaining IDs for distributed deduplication."""
+
+    processor: Any
+    prompt_template: ProtocolPromptTemplate
+
+    def __call__(self, records: list[ProtocolDatasetRecord]) -> dict[str, Any]:
+        conversations = [
+            self.prompt_template.conversation(
+                image=record.image_path,
+                width=record.canvas_width,
+                height=record.canvas_height,
+            )
+            for record in records
+        ]
+        batch = self.processor.apply_chat_template(
+            conversations,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+            processor_kwargs={"padding": True},
+        )
+        batch["_sample_ids"] = [record.sample_id for record in records]
+        return dict(batch)

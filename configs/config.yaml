@@ -56,6 +56,11 @@ training:
 
 evaluation:
   per_device_batch_size: 1
+  generation:
+    enabled: true
+    num_samples: 32
+    per_device_batch_size: 1
+    max_new_tokens: 4096
 
 tracking:
   provider: wandb

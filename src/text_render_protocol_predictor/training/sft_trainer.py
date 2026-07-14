@@ -9,7 +9,11 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
+
+from ..evaluation.runner import evaluate_generation
+from .collator import ProtocolGenerationCollator
+from .prompts import ProtocolPromptTemplate
 
 
 @dataclass
@@ -62,18 +66,36 @@ def _load_checkpoint(accelerator: Any, checkpoint: Path) -> TrainerState:
         return TrainerState(**json.load(stream))
 
 
+def _token_accuracy_counts(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    predictions = logits[:, :-1].argmax(dim=-1)
+    shifted_labels = labels[:, 1:]
+    valid = shifted_labels.ne(-100)
+    correct = predictions.eq(shifted_labels).logical_and(valid).sum()
+    return torch.stack((correct, valid.sum())).to(dtype=torch.float64)
+
+
 @torch.no_grad()
-def evaluate_loss(accelerator: Any, model: Any, dataloader: DataLoader) -> float:
+def evaluate_teacher_forced(
+    accelerator: Any, model: Any, dataloader: DataLoader
+) -> tuple[float, float]:
     model.eval()
     losses = []
+    accuracy_counts = torch.zeros(2, dtype=torch.float64, device=accelerator.device)
     for batch in dataloader:
         output = model(**batch)
         gathered = accelerator.gather_for_metrics(output.loss.detach().repeat(batch["input_ids"].shape[0]))
         losses.append(gathered.float().cpu())
+        accuracy_counts += _token_accuracy_counts(output.logits, batch["labels"])
+    accuracy_counts = accelerator.reduce(accuracy_counts, reduction="sum")
     model.train()
     if not losses:
-        return math.nan
-    return torch.cat(losses).mean().item()
+        return math.nan, math.nan
+    token_accuracy = (
+        (accuracy_counts[0] / accuracy_counts[1]).item()
+        if accuracy_counts[1].item() > 0
+        else math.nan
+    )
+    return torch.cat(losses).mean().item(), token_accuracy
 
 
 def train_sft(
@@ -115,6 +137,22 @@ def train_sft(
         pin_memory=True,
         persistent_workers=int(cfg.dataset.num_workers) > 0,
     )
+    generation_loader = None
+    if bool(cfg.evaluation.generation.enabled):
+        generation_size = min(int(cfg.evaluation.generation.num_samples), len(validation_dataset))
+        generation_dataset = Subset(validation_dataset, range(generation_size))
+        generation_loader = DataLoader(
+            generation_dataset,
+            batch_size=int(cfg.evaluation.generation.per_device_batch_size),
+            shuffle=False,
+            collate_fn=ProtocolGenerationCollator(
+                processor=processor,
+                prompt_template=ProtocolPromptTemplate(),
+            ),
+            num_workers=int(cfg.dataset.num_workers),
+            pin_memory=True,
+            persistent_workers=int(cfg.dataset.num_workers) > 0,
+        )
     optimizer = torch.optim.AdamW(
         _trainable_parameters(model),
         lr=float(cfg.training.learning_rate),
@@ -129,6 +167,8 @@ def train_sft(
     model, optimizer, train_loader, validation_loader, scheduler = accelerator.prepare(
         model, optimizer, train_loader, validation_loader, scheduler
     )
+    if generation_loader is not None:
+        generation_loader = accelerator.prepare(generation_loader)
 
     resolved_config = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
     resolved_config["training"]["effective_global_batch_size"] = (
@@ -187,6 +227,15 @@ def train_sft(
                 continue
             state.global_step += 1
             mean_loss = accelerator.gather(loss.detach()).float().mean().item()
+            train_accuracy_counts = accelerator.reduce(
+                _token_accuracy_counts(output.logits.detach(), batch["labels"]),
+                reduction="sum",
+            )
+            train_token_accuracy = (
+                (train_accuracy_counts[0] / train_accuracy_counts[1]).item()
+                if train_accuracy_counts[1].item() > 0
+                else math.nan
+            )
             learning_rate = scheduler.get_last_lr()[0]
             progress.update(1)
             progress.set_postfix(
@@ -198,14 +247,30 @@ def train_sft(
             accelerator.log(
                 {
                     "train/loss": mean_loss,
+                    "train/token_accuracy": train_token_accuracy,
                     "train/learning_rate": learning_rate,
                     "train/epoch": state.epoch,
                 },
                 step=state.global_step,
             )
             if state.global_step % int(cfg.training.eval_steps) == 0:
-                validation_loss = evaluate_loss(accelerator, model, validation_loader)
-                accelerator.log({"validation/loss": validation_loss}, step=state.global_step)
+                validation_loss, validation_token_accuracy = evaluate_teacher_forced(
+                    accelerator, model, validation_loader
+                )
+                evaluation_metrics = {
+                    "validation/loss": validation_loss,
+                    "validation/token_accuracy": validation_token_accuracy,
+                }
+                if generation_loader is not None:
+                    validity = evaluate_generation(
+                        accelerator=accelerator,
+                        model=model,
+                        processor=processor,
+                        dataloader=generation_loader,
+                        max_new_tokens=int(cfg.evaluation.generation.max_new_tokens),
+                    )
+                    evaluation_metrics.update(validity.as_log_dict())
+                accelerator.log(evaluation_metrics, step=state.global_step)
             if state.global_step % int(cfg.training.save_steps) == 0:
                 _save_checkpoint(
                     accelerator, model, processor, state, output_dir, resolved_config
