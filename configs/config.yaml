@@ -21,6 +21,7 @@ protocol:
 
 model:
   name_or_path: Qwen/Qwen3-VL-8B-Instruct
+  weights_path: null
   precision: bf16
   max_output_tokens: 4096
   max_sequence_tokens: 16384

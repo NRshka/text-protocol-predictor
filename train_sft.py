@@ -13,6 +13,11 @@ from text_render_protocol_predictor.training.sft_trainer import train_sft
 
 @hydra.main(version_base="1.3", config_path="configs", config_name="config")
 def main(cfg: DictConfig) -> None:
+    if cfg.model.weights_path and cfg.training.resume_from:
+        raise ValueError(
+            "model.weights_path initializes PEFT weights with fresh training state; "
+            "it cannot be combined with training.resume_from"
+        )
     common = {
         "dataset_root": cfg.dataset.root_dir,
         "decimal_places": int(cfg.protocol.decimal_places),
