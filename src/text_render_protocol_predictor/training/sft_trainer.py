@@ -30,6 +30,16 @@ def _trainable_parameters(model: Any) -> list[torch.nn.Parameter]:
     return parameters
 
 
+def _step_scheduler_after_optimizer(
+    *, scheduler: Any, sync_gradients: bool, optimizer_step_was_skipped: bool
+) -> bool:
+    """Advance once per successful global optimizer update, independent of world size."""
+    if not sync_gradients or optimizer_step_was_skipped:
+        return False
+    scheduler.step()
+    return True
+
+
 def _save_checkpoint(
     accelerator: Any,
     model: Any,
@@ -117,6 +127,10 @@ def train_sft(
         gradient_accumulation_steps=int(cfg.training.gradient_accumulation_steps),
         mixed_precision=str(cfg.model.precision),
         log_with="wandb" if cfg.tracking.provider == "wandb" else None,
+        # The schedule is configured in global optimizer steps. Accelerate's
+        # default prepared scheduler advances once per process when batches are
+        # not split, which makes a 4-GPU schedule run 4x too fast.
+        step_scheduler_with_optimizer=False,
     )
     set_seed(int(cfg.training.seed), device_specific=True)
     train_loader = DataLoader(
@@ -219,11 +233,21 @@ def train_sft(
                         model.parameters(), float(cfg.training.gradient_clip_norm)
                     )
                 optimizer.step()
-                scheduler.step()
+                _step_scheduler_after_optimizer(
+                    scheduler=scheduler,
+                    sync_gradients=accelerator.sync_gradients,
+                    optimizer_step_was_skipped=optimizer.step_was_skipped,
+                )
                 optimizer.zero_grad(set_to_none=True)
 
             state.batch_in_epoch = batch_index + 1
             if not accelerator.sync_gradients:
+                continue
+            if optimizer.step_was_skipped:
+                accelerator.log(
+                    {"train/skipped_optimizer_steps": 1},
+                    step=state.global_step,
+                )
                 continue
             state.global_step += 1
             mean_loss = accelerator.gather(loss.detach()).float().mean().item()
