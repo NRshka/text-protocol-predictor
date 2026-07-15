@@ -15,6 +15,9 @@ class ManifestEntry(BaseModel):
     protocol: str = Field(min_length=1)
     seed: int
 
+    recipe: str | None = None
+    template_id: str | None = None
+
 
 def load_manifest(path: str | Path) -> list[ManifestEntry]:
     path = Path(path)

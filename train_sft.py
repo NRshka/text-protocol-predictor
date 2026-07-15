@@ -5,10 +5,10 @@ from __future__ import annotations
 import hydra
 from omegaconf import DictConfig
 
-from text_render_protocol_predictor.data import ProtocolManifestDataset, validate_dataset
-from text_render_protocol_predictor.models import load_qwen3_vl_for_sft
-from text_render_protocol_predictor.training import ProtocolPromptTemplate, ProtocolSFTCollator
-from text_render_protocol_predictor.training.sft_trainer import train_sft
+from src.text_render_protocol_predictor.data import ProtocolManifestDataset, validate_dataset
+from src.text_render_protocol_predictor.models import load_qwen3_vl_for_sft
+from src.text_render_protocol_predictor.training import ProtocolPromptTemplate, ProtocolSFTCollator
+from src.text_render_protocol_predictor.training.sft_trainer import train_sft
 
 
 @hydra.main(version_base="1.3", config_path="configs", config_name="config")

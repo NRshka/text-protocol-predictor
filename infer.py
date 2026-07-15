@@ -9,9 +9,9 @@ import torch
 from PIL import Image
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
-from text_render_protocol_predictor.evaluation import evaluate_generation_validity
-from text_render_protocol_predictor.models.qwen3_vl import inspect_peft_weights_directory
-from text_render_protocol_predictor.training import ProtocolPromptTemplate
+from src.text_render_protocol_predictor.evaluation import evaluate_generation_validity
+from src.text_render_protocol_predictor.models.qwen3_vl import inspect_peft_weights_directory
+from src.text_render_protocol_predictor.training import ProtocolPromptTemplate
 
 
 def parse_args() -> argparse.Namespace:
@@ -104,9 +104,11 @@ def main() -> None:
     )
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(output + "\n", encoding="utf-8")
+        # args.output.write_text(output + "\n", encoding="utf-8")
+        with open(args.output, "w") as file:
+            json.dump(json.loads(output), file, ensure_ascii=False, indent=4)
     if args.pretty and metrics.valid_json_count:
-        print(json.dumps(json.loads(output), ensure_ascii=False, indent=2))
+        print(json.dumps(json.loads(output), ensure_ascii=False, indent=4))
     else:
         print(output)
 
