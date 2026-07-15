@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -81,6 +82,9 @@ def main() -> None:
         processor_kwargs={"padding": True},
     ).to(args.device)
 
+    if args.device.startswith("cuda"):
+        torch.cuda.synchronize(args.device)
+    generation_started_at = time.perf_counter()
     with torch.inference_mode():
         generated = model.generate(
             **batch,
@@ -88,6 +92,9 @@ def main() -> None:
             max_new_tokens=args.max_new_tokens,
             use_cache=True,
         )
+    if args.device.startswith("cuda"):
+        torch.cuda.synchronize(args.device)
+    generation_latency_seconds = time.perf_counter() - generation_started_at
     completion = generated[:, batch["input_ids"].shape[1] :]
     output = processor.batch_decode(
         completion,
@@ -99,7 +106,8 @@ def main() -> None:
     print(
         f"valid_json={bool(metrics.valid_json_count)} "
         f"schema_valid={bool(metrics.schema_valid_count)} "
-        f"generated_tokens={completion.shape[1]}",
+        f"generated_tokens={completion.shape[1]} "
+        f"generation_latency_seconds={generation_latency_seconds:.3f}",
         file=sys.stderr,
     )
     if args.output:
