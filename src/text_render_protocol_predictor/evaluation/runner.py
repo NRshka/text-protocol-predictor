@@ -17,14 +17,24 @@ def evaluate_generation(
     processor: Any,
     dataloader: Any,
     max_new_tokens: int,
+    progress_bar: bool = True,
 ) -> GenerationValidityMetrics:
     from accelerate.utils import gather_object
+    from tqdm.auto import tqdm
 
     was_training = model.training
     model.eval()
     generation_model = accelerator.unwrap_model(model)
     local_results: list[tuple[str, str]] = []
-    for batch in dataloader:
+    batches = tqdm(
+        dataloader,
+        desc="Generation evaluation",
+        unit="batch",
+        dynamic_ncols=True,
+        leave=False,
+        disable=not progress_bar or not accelerator.is_local_main_process,
+    )
+    for batch in batches:
         sample_ids = batch.pop("_sample_ids")
         input_length = batch["input_ids"].shape[1]
         generated = generation_model.generate(
@@ -49,4 +59,3 @@ def evaluate_generation(
     if was_training:
         model.train()
     return evaluate_generation_validity(list(unique_outputs.values()))
-

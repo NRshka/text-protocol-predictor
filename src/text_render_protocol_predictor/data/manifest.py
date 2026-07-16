@@ -17,6 +17,7 @@ class ManifestEntry(BaseModel):
 
     recipe: str | None = None
     template_id: str | None = None
+    structural_groups: dict[str, str] | None = None
 
 
 def load_manifest(path: str | Path) -> list[ManifestEntry]:

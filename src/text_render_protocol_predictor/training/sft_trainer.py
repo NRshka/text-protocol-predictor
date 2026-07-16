@@ -292,6 +292,7 @@ def train_sft(
                         processor=processor,
                         dataloader=generation_loader,
                         max_new_tokens=int(cfg.evaluation.generation.max_new_tokens),
+                        progress_bar=bool(cfg.training.progress_bar),
                     )
                     evaluation_metrics.update(validity.as_log_dict())
                 accelerator.log(evaluation_metrics, step=state.global_step)

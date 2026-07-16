@@ -12,6 +12,29 @@ dataset:
   num_workers: 8
   preflight_validation: true
 
+augmentation:
+  structural_noise:
+    enabled: false
+    probability: 1.0
+    seed: 0
+    group_translation_std_x: 0.015
+    group_translation_std_y: 0.015
+    group_scale_min: 0.95
+    group_scale_max: 1.05
+    group_rotation_probability: 0.15
+    group_rotation_min_degrees: 0.5
+    group_rotation_max_degrees: 2.0
+    local_position_min: 0.003
+    local_position_max: 0.010
+    local_size_min: 0.02
+    local_size_max: 0.06
+    local_rotation_probability: 0.15
+    local_rotation_min_degrees: 0.5
+    local_rotation_max_degrees: 2.0
+    bend_probability: 0.05
+    bend_min_fraction: 0.03
+    bend_max_fraction: 0.12
+
 protocol:
   version: "1.0"
   canonicalizer_version: "1.0.0"

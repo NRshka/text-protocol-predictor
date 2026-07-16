@@ -5,7 +5,11 @@ from __future__ import annotations
 import hydra
 from omegaconf import DictConfig
 
-from src.text_render_protocol_predictor.data import ProtocolManifestDataset, validate_dataset
+from src.text_render_protocol_predictor.data import (
+    ProtocolManifestDataset,
+    StructuralNoiseConfig,
+    validate_dataset,
+)
 from src.text_render_protocol_predictor.models import load_qwen3_vl_for_sft
 from src.text_render_protocol_predictor.training import ProtocolPromptTemplate, ProtocolSFTCollator
 from src.text_render_protocol_predictor.training.sft_trainer import train_sft
@@ -26,6 +30,9 @@ def main(cfg: DictConfig) -> None:
     }
     train_dataset = ProtocolManifestDataset(
         manifest_path=cfg.dataset.manifests.train,
+        structural_noise=StructuralNoiseConfig.from_mapping(
+            cfg.augmentation.structural_noise
+        ),
         **common,
     )
     validation_dataset = ProtocolManifestDataset(
