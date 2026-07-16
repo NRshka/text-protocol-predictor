@@ -15,13 +15,12 @@ DEFAULT_DECIMAL_PLACES = 3
 
 
 def project_protocol(value: DatasetProtocol | Mapping[str, Any]) -> PredictionProtocol:
-    """Remove dataset-only fields and deterministically assign target object IDs."""
+    """Remove dataset-only fields while preserving semantic object IDs."""
     protocol = validate_dataset_protocol(value)
     ordered = sorted(protocol.objects, key=lambda obj: (obj.z_order, obj.id))
     objects = []
-    for index, obj in enumerate(ordered):
+    for obj in ordered:
         data = obj.model_dump(exclude={"tight_bbox"})
-        data["id"] = f"text_{index:03d}"
         data["text"] = unicodedata.normalize("NFC", data["text"])
         objects.append(PredictionObject.model_validate(data))
     return PredictionProtocol(
@@ -78,4 +77,3 @@ def canonicalize(
         allow_nan=False,
         separators=(",", ":"),
     )
-

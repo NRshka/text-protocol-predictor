@@ -8,7 +8,7 @@ def test_projection_and_canonicalization(protocol_dict: dict) -> None:
     target = json.loads(serialized)
 
     assert list(target) == ["protocol_version", "canvas", "objects"]
-    assert [obj["id"] for obj in target["objects"]] == ["text_000", "text_001"]
+    assert [obj["id"] for obj in target["objects"]] == ["source-a", "source-b"]
     assert target["objects"][1]["text"] == "Café"
     assert target["objects"][1]["geometry"]["box"]["x"] == 0
     assert target["objects"][1]["geometry"]["box"]["y"] == 20.124
@@ -19,4 +19,3 @@ def test_projection_and_canonicalization(protocol_dict: dict) -> None:
 def test_canonicalization_is_idempotent(protocol_dict: dict) -> None:
     once = canonicalize(protocol_dict)
     assert canonicalize(once) == once
-
