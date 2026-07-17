@@ -1,4 +1,4 @@
-"""Accelerate-native SFT loop with resumable state and W&B tracking."""
+"""Accelerate-native SFT loop with resumable state and configurable tracking."""
 
 from __future__ import annotations
 
@@ -84,6 +84,39 @@ def _token_accuracy_counts(logits: torch.Tensor, labels: torch.Tensor) -> torch.
     return torch.stack((correct, valid.sum())).to(dtype=torch.float64)
 
 
+def _tracking_configuration(tracking_cfg: Any) -> tuple[str | None, dict[str, dict[str, Any]]]:
+    """Resolve the selected Accelerate tracker and its provider-specific arguments."""
+    raw_provider = getattr(tracking_cfg, "provider", None)
+    provider = None if raw_provider is None else str(raw_provider).strip().lower()
+    if provider in {None, "", "none", "null", "disabled"}:
+        return None, {}
+
+    if provider == "wandb":
+        wandb_cfg = tracking_cfg.wandb
+        return provider, {
+            provider: {
+                "entity": wandb_cfg.entity,
+                "name": tracking_cfg.run_name,
+                "mode": str(wandb_cfg.mode),
+            }
+        }
+
+    if provider == "clearml":
+        clearml_cfg = tracking_cfg.clearml
+        init_kwargs: dict[str, Any] = {
+            "project_name": str(tracking_cfg.project),
+            "task_type": str(clearml_cfg.task_type),
+            "reuse_last_task_id": bool(clearml_cfg.reuse_last_task_id),
+        }
+        if tracking_cfg.run_name:
+            init_kwargs["task_name"] = str(tracking_cfg.run_name)
+        return provider, {provider: init_kwargs}
+
+    raise ValueError(
+        f"unsupported tracking provider {raw_provider!r}; expected wandb, clearml, or none"
+    )
+
+
 @torch.no_grad()
 def evaluate_teacher_forced(
     accelerator: Any, model: Any, dataloader: DataLoader
@@ -123,10 +156,11 @@ def train_sft(
     from tqdm.auto import tqdm
     from transformers import get_scheduler
 
+    tracker_name, tracker_init_kwargs = _tracking_configuration(cfg.tracking)
     accelerator = Accelerator(
         gradient_accumulation_steps=int(cfg.training.gradient_accumulation_steps),
         mixed_precision=str(cfg.model.precision),
-        log_with="wandb" if cfg.tracking.provider == "wandb" else None,
+        log_with=tracker_name,
         # The schedule is configured in global optimizer steps. Accelerate's
         # default prepared scheduler advances once per process when batches are
         # not split, which makes a 4-GPU schedule run 4x too fast.
@@ -190,17 +224,12 @@ def train_sft(
         * accelerator.num_processes
         * int(cfg.training.gradient_accumulation_steps)
     )
-    accelerator.init_trackers(
-        project_name=str(cfg.tracking.project),
-        config=resolved_config,
-        init_kwargs={
-            "wandb": {
-                "entity": cfg.tracking.entity,
-                "name": cfg.tracking.run_name,
-                "mode": str(cfg.tracking.mode),
-            }
-        },
-    )
+    if tracker_name is not None:
+        accelerator.init_trackers(
+            project_name=str(cfg.tracking.project),
+            config=resolved_config,
+            init_kwargs=tracker_init_kwargs,
+        )
     output_dir = Path(cfg.training.output_dir)
     state = TrainerState()
     if cfg.training.resume_from:
