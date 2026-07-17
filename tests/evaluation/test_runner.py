@@ -44,7 +44,14 @@ def test_generation_evaluation_reports_batch_progress(monkeypatch) -> None:
             '{"protocol_version":"1.0","canvas":{"width":1,"height":1},"objects":[]}'
         ]
     )
-    dataloader = [{"_sample_ids": ["sample-1"], "input_ids": torch.tensor([[1]])}]
+    target = '{"protocol_version":"1.0","canvas":{"width":1,"height":1},"objects":[]}'
+    dataloader = [
+        {
+            "_sample_ids": ["sample-1"],
+            "_targets": [target],
+            "input_ids": torch.tensor([[1]]),
+        }
+    ]
 
     metrics = evaluate_generation(
         accelerator=accelerator,
@@ -59,4 +66,5 @@ def test_generation_evaluation_reports_batch_progress(monkeypatch) -> None:
     assert progress_args["unit"] == "batch"
     assert progress_args["disable"] is False
     assert metrics.evaluated_count == 1
+    assert metrics.semantic_id_exact_match == 1.0
     assert model.training is True

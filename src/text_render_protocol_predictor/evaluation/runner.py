@@ -6,7 +6,7 @@ from typing import Any
 
 import torch
 
-from .generation import GenerationValidityMetrics, evaluate_generation_validity
+from .generation import GenerationValidityMetrics, evaluate_generation_predictions
 
 
 @torch.no_grad()
@@ -25,7 +25,7 @@ def evaluate_generation(
     was_training = model.training
     model.eval()
     generation_model = accelerator.unwrap_model(model)
-    local_results: list[tuple[str, str]] = []
+    local_results: list[tuple[str, str, str]] = []
     batches = tqdm(
         dataloader,
         desc="Generation evaluation",
@@ -36,6 +36,7 @@ def evaluate_generation(
     )
     for batch in batches:
         sample_ids = batch.pop("_sample_ids")
+        targets = batch.pop("_targets")
         input_length = batch["input_ids"].shape[1]
         generated = generation_model.generate(
             **batch,
@@ -50,12 +51,14 @@ def evaluate_generation(
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
         )
-        local_results.extend(zip(sample_ids, decoded, strict=True))
+        local_results.extend(zip(sample_ids, decoded, targets, strict=True))
 
     gathered_results = gather_object(local_results)
-    unique_outputs: dict[str, str] = {}
-    for sample_id, output in gathered_results:
-        unique_outputs.setdefault(sample_id, output)
+    unique_results: dict[str, tuple[str, str]] = {}
+    for sample_id, output, target in gathered_results:
+        unique_results.setdefault(sample_id, (output, target))
     if was_training:
         model.train()
-    return evaluate_generation_validity(list(unique_outputs.values()))
+    outputs = [result[0] for result in unique_results.values()]
+    targets = [result[1] for result in unique_results.values()]
+    return evaluate_generation_predictions(outputs, targets)

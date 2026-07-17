@@ -144,4 +144,5 @@ class ProtocolGenerationCollator:
             processor_kwargs={"padding": True},
         )
         batch["_sample_ids"] = [record.sample_id for record in records]
+        batch["_targets"] = [record.canonical_protocol for record in records]
         return dict(batch)
