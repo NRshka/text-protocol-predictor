@@ -36,6 +36,51 @@ def test_generation_task_metrics_are_perfect_for_exact_prediction(
     assert metrics.semantic_id_precision == 1.0
     assert metrics.semantic_id_recall == 1.0
     assert metrics.semantic_id_exact_match == 1.0
+    assert metrics.color_mae == 0.0
+    assert metrics.color_channel_count == 6
+    assert metrics.bezier_mse == 0.0
+    assert metrics.bezier_coordinate_count == 0
+
+
+def test_generation_task_metrics_measure_bezier_and_rgb_errors(protocol_dict: dict) -> None:
+    target = json.loads(canonicalize(protocol_dict))
+    prediction = json.loads(canonicalize(protocol_dict))
+    for document in (target, prediction):
+        geometry = document["objects"][0]["geometry"]
+        geometry["mode"] = "bezier"
+        geometry["baseline"] = {
+            "p0": {"x": 0, "y": 0},
+            "p1": {"x": 1, "y": 1},
+            "p2": {"x": 2, "y": 2},
+            "p3": {"x": 3, "y": 3},
+        }
+    prediction["objects"][0]["geometry"]["baseline"]["p2"]["x"] += 4
+    prediction["objects"][0]["style"]["fill"]["color"] = "#F00A14FF"
+    target["objects"][0]["style"]["fill"]["color"] = "#FA141EFF"
+
+    metrics = evaluate_generation_predictions([json.dumps(prediction)], [json.dumps(target)])
+
+    assert metrics.bezier_mse == 2.0
+    assert metrics.bezier_coordinate_count == 8
+    assert metrics.color_mae == pytest.approx(5.0)
+    assert metrics.color_channel_count == 6
+
+
+def test_bezier_mse_excludes_straight_predictions(protocol_dict: dict) -> None:
+    target = json.loads(canonicalize(protocol_dict))
+    geometry = target["objects"][0]["geometry"]
+    geometry["mode"] = "bezier"
+    geometry["baseline"] = {
+        "p0": {"x": 0, "y": 0},
+        "p1": {"x": 1, "y": 1},
+        "p2": {"x": 2, "y": 2},
+        "p3": {"x": 3, "y": 3},
+    }
+
+    metrics = evaluate_generation_predictions([canonicalize(protocol_dict)], [json.dumps(target)])
+
+    assert metrics.bezier_mse == 0.0
+    assert metrics.bezier_coordinate_count == 0
 
 
 def test_generation_task_metrics_penalize_missing_and_extra_ids(

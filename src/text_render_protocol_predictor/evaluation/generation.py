@@ -8,7 +8,12 @@ from dataclasses import dataclass
 
 from pydantic import ValidationError
 
-from ..protocol.schema import BoundingBox, PredictionProtocol
+from ..protocol.schema import (
+    BoundingBox,
+    LinearGradientFill,
+    PredictionProtocol,
+    SolidFill,
+)
 
 
 @dataclass(frozen=True)
@@ -27,6 +32,10 @@ class GenerationValidityMetrics:
     reference_character_count: int = 0
     word_error_count: int = 0
     reference_word_count: int = 0
+    bezier_squared_error_sum: float = 0.0
+    bezier_coordinate_count: int = 0
+    color_absolute_error_sum: float = 0.0
+    color_channel_count: int = 0
     has_ground_truth: bool = False
 
     @property
@@ -64,6 +73,20 @@ class GenerationValidityMetrics:
         if self.ground_truth_object_count == 0:
             return 0.0
         return self.font_correct_count / self.ground_truth_object_count
+
+    @property
+    def bezier_mse(self) -> float:
+        """MSE over the eight cubic-Bezier control-point coordinates compared."""
+        if self.bezier_coordinate_count == 0:
+            return 0.0
+        return self.bezier_squared_error_sum / self.bezier_coordinate_count
+
+    @property
+    def color_mae(self) -> float:
+        """MAE over RGB fill channels, in the protocol's 0--255 color scale."""
+        if self.color_channel_count == 0:
+            return 0.0
+        return self.color_absolute_error_sum / self.color_channel_count
 
     @property
     def semantic_id_precision(self) -> float:
@@ -105,6 +128,10 @@ class GenerationValidityMetrics:
                     "generation/cer": self.character_error_rate,
                     "generation/wer": self.word_error_rate,
                     "generation/font_accuracy": self.font_accuracy,
+                    "generation/bezier_mse": self.bezier_mse,
+                    "generation/bezier_coordinate_count": self.bezier_coordinate_count,
+                    "generation/color_mae": self.color_mae,
+                    "generation/color_channel_count": self.color_channel_count,
                     "generation/semantic_id_precision": self.semantic_id_precision,
                     "generation/semantic_id_recall": self.semantic_id_recall,
                     "generation/semantic_id_exact_match": self.semantic_id_exact_match,
@@ -153,6 +180,24 @@ def _box_iou(left: BoundingBox, right: BoundingBox) -> float:
     intersection = intersection_width * intersection_height
     union = left.width * left.height + right.width * right.height - intersection
     return intersection / union if union > 0 else 0.0
+
+
+def _rgb(color: str) -> tuple[int, int, int]:
+    return (int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16))
+
+
+def _fill_rgb_samples(
+    fill: SolidFill | LinearGradientFill,
+) -> list[tuple[int, int, int]]:
+    """Return comparable RGB samples for a solid fill or a gradient.
+
+    Solid fills are constant. Gradients are sampled at their declared stop
+    colors. A pair is compared only when both fills expose the same number of
+    samples; this avoids inventing a correspondence between unrelated stops.
+    """
+    if isinstance(fill, SolidFill):
+        return [_rgb(fill.color)]
+    return [_rgb(stop.color) for stop in fill.stops]
 
 
 def _parse_prediction(output: str) -> tuple[bool, PredictionProtocol | None]:
@@ -205,6 +250,10 @@ def evaluate_generation_predictions(
     reference_characters = 0
     word_errors = 0
     reference_words = 0
+    bezier_squared_error_sum = 0.0
+    bezier_coordinate_count = 0
+    color_absolute_error_sum = 0.0
+    color_channel_count = 0
 
     for output, raw_target in zip(outputs, targets, strict=True):
         target = (
@@ -254,6 +303,35 @@ def evaluate_generation_predictions(
             )
             font_correct += int(target_obj.style.font_id == prediction_obj.style.font_id)
 
+            # A straight prediction has no curve and is intentionally excluded,
+            # as is a straight target for which no ground-truth curve exists.
+            target_baseline = target_obj.geometry.baseline
+            prediction_baseline = prediction_obj.geometry.baseline
+            if target_baseline is not None and prediction_baseline is not None:
+                for point_name in ("p0", "p1", "p2", "p3"):
+                    target_point = getattr(target_baseline, point_name)
+                    prediction_point = getattr(prediction_baseline, point_name)
+                    for coordinate in ("x", "y"):
+                        difference = getattr(prediction_point, coordinate) - getattr(
+                            target_point, coordinate
+                        )
+                        bezier_squared_error_sum += difference * difference
+                        bezier_coordinate_count += 1
+
+            target_colors = _fill_rgb_samples(target_obj.style.fill)
+            prediction_colors = _fill_rgb_samples(prediction_obj.style.fill)
+            if len(target_colors) == len(prediction_colors):
+                for target_color, prediction_color in zip(
+                    target_colors, prediction_colors, strict=True
+                ):
+                    color_absolute_error_sum += sum(
+                        abs(predicted - expected)
+                        for expected, predicted in zip(
+                            target_color, prediction_color, strict=True
+                        )
+                    )
+                    color_channel_count += 3
+
     return GenerationValidityMetrics(
         evaluated_count=len(outputs),
         valid_json_count=valid_json,
@@ -269,5 +347,9 @@ def evaluate_generation_predictions(
         reference_character_count=reference_characters,
         word_error_count=word_errors,
         reference_word_count=reference_words,
+        bezier_squared_error_sum=bezier_squared_error_sum,
+        bezier_coordinate_count=bezier_coordinate_count,
+        color_absolute_error_sum=color_absolute_error_sum,
+        color_channel_count=color_channel_count,
         has_ground_truth=True,
     )
