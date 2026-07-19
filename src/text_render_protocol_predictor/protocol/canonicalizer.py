@@ -7,7 +7,7 @@ import unicodedata
 from decimal import Decimal, ROUND_HALF_EVEN
 from typing import Any, Mapping
 
-from .schema import DatasetProtocol, PredictionObject, PredictionProtocol
+from .schema import DatasetProtocol, PredictionProtocol
 from .validator import validate_dataset_protocol
 
 CANONICALIZER_VERSION = "1.0.0"
@@ -20,13 +20,19 @@ def project_protocol(value: DatasetProtocol | Mapping[str, Any]) -> PredictionPr
     ordered = sorted(protocol.objects, key=lambda obj: (obj.z_order, obj.id))
     objects = []
     for obj in ordered:
-        data = obj.model_dump(exclude={"tight_bbox"})
-        data["text"] = unicodedata.normalize("NFC", data["text"])
-        objects.append(PredictionObject.model_validate(data))
-    return PredictionProtocol(
-        protocol_version=protocol.protocol_version,
-        canvas=protocol.canvas,
-        objects=objects,
+        excluded = {"tight_bbox", "annotation"}
+        if protocol.protocol_version == "1.0":
+            excluded.add("object_type")
+        data = obj.model_dump(exclude=excluded)
+        if data.get("object_type", "text") == "text":
+            data["text"] = unicodedata.normalize("NFC", data["text"])
+        objects.append(data)
+    return PredictionProtocol.model_validate(
+        {
+            "protocol_version": protocol.protocol_version,
+            "canvas": protocol.canvas.model_dump(),
+            "objects": objects,
+        }
     )
 
 
@@ -66,7 +72,7 @@ def canonicalize(
     ):
         target = project_protocol(value)
     elif isinstance(value, PredictionProtocol):
-        target = value
+        target = PredictionProtocol.model_validate(value)
     else:
         target = PredictionProtocol.model_validate(value)
 

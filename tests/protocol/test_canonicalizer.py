@@ -19,3 +19,16 @@ def test_projection_and_canonicalization(protocol_dict: dict) -> None:
 def test_canonicalization_is_idempotent(protocol_dict: dict) -> None:
     once = canonicalize(protocol_dict)
     assert canonicalize(once) == once
+
+
+def test_version_21_projection_keeps_shapes_and_removes_evidence(
+    protocol_21_dict: dict,
+) -> None:
+    target = json.loads(canonicalize(protocol_21_dict))
+
+    assert target["protocol_version"] == "2.1"
+    assert [obj["object_type"] for obj in target["objects"]] == ["shape", "text"]
+    assert "purpose" not in target
+    assert all("annotation" not in obj for obj in target["objects"])
+    assert all("tight_bbox" not in obj for obj in target["objects"])
+    assert canonicalize(json.dumps(target)) == canonicalize(protocol_21_dict)

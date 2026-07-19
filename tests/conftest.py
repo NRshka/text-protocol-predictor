@@ -76,3 +76,44 @@ def protocol_dict() -> dict:
 def copied_protocol(protocol_dict: dict) -> dict:
     return copy.deepcopy(protocol_dict)
 
+
+@pytest.fixture
+def protocol_21_dict(protocol_dict: dict) -> dict:
+    text = copy.deepcopy(protocol_dict["objects"][0])
+    text["object_type"] = "text"
+    text["annotation"] = {
+        "text_confidence": 0.9,
+        "geometry_confidence": 0.8,
+        "style_confidence": 0.7,
+        "font_match": "nearest",
+        "notes": None,
+    }
+    return {
+        "protocol_version": "2.1",
+        "purpose": "annotation",
+        "sample_id": "sample-21",
+        "seed": 0,
+        "canvas": copy.deepcopy(protocol_dict["canvas"]),
+        "background": copy.deepcopy(protocol_dict["background"]),
+        "objects": [
+            text,
+            {
+                "object_type": "shape",
+                "id": "panel",
+                "shape": "rectangle",
+                "geometry": {
+                    "box": {"x": 5, "y": 6, "width": 400, "height": 100},
+                    "rotation_degrees": 0,
+                    "corner_radius": 12,
+                },
+                "style": {
+                    "fill": {"type": "solid", "color": "#102030FF"},
+                    "stroke": {"width": 1, "color": "#FFFFFFFF"},
+                    "shadow": None,
+                },
+                "z_order": -1,
+                "tight_bbox": None,
+                "annotation": {"geometry_confidence": 0.95},
+            },
+        ],
+    }

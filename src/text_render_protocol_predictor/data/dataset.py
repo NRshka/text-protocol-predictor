@@ -26,6 +26,8 @@ class ProtocolDatasetRecord:
     protocol_path: Path
     canvas_width: int
     canvas_height: int
+    protocol_version: str
+    purpose: str
     protocol: DatasetProtocol
     canonical_protocol: str
     seed: int
@@ -51,6 +53,7 @@ class ProtocolManifestDataset:
         if not manifest.is_absolute():
             manifest = resolve_dataset_path(self.dataset_root, str(manifest))
         self.manifest_path = manifest
+        self.entry_root = manifest.parent
         self.entries = load_manifest(manifest)
         self.decimal_places = decimal_places
         self.font_ids = font_ids
@@ -64,8 +67,13 @@ class ProtocolManifestDataset:
 
     def __getitem__(self, index: int) -> ProtocolDatasetRecord:
         entry: ManifestEntry = self.entries[index]
-        image_path = resolve_dataset_path(self.dataset_root, entry.image)
-        protocol_path = resolve_dataset_path(self.dataset_root, entry.protocol)
+        relative_manifest_root = self.entry_root.relative_to(self.dataset_root)
+        image_path = resolve_dataset_path(
+            self.dataset_root, str(relative_manifest_root / entry.image)
+        )
+        protocol_path = resolve_dataset_path(
+            self.dataset_root, str(relative_manifest_root / entry.protocol)
+        )
         if self.require_files and not image_path.is_file():
             raise FileNotFoundError(f"image does not exist: {image_path}")
         if not protocol_path.is_file():
@@ -90,7 +98,7 @@ class ProtocolManifestDataset:
         protocol = apply_structural_noise(
             protocol,
             config=self.structural_noise,
-            seed=self.structural_noise.seed + entry.seed,
+            seed=self.structural_noise.seed + protocol.seed,
             object_groups=entry.structural_groups,
         )
         return ProtocolDatasetRecord(
@@ -99,9 +107,11 @@ class ProtocolManifestDataset:
             protocol_path=protocol_path,
             canvas_width=protocol.canvas.width,
             canvas_height=protocol.canvas.height,
+            protocol_version=protocol.protocol_version,
+            purpose=getattr(protocol, "purpose", "render"),
             protocol=protocol,
             canonical_protocol=canonicalize(protocol, decimal_places=self.decimal_places),
-            seed=entry.seed,
+            seed=protocol.seed,
         )
 
     @staticmethod
@@ -111,7 +121,7 @@ class ProtocolManifestDataset:
                 f"manifest sample_id {entry.sample_id!r} does not match protocol "
                 f"sample_id {protocol.sample_id!r}"
             )
-        if entry.seed != protocol.seed:
+        if entry.seed is not None and entry.seed != protocol.seed:
             raise ValueError(
                 f"manifest seed {entry.seed} does not match protocol seed {protocol.seed}"
             )

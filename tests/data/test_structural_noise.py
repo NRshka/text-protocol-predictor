@@ -74,3 +74,26 @@ def test_bending_converts_straight_geometry_to_bezier(protocol_dict: dict) -> No
     assert all(obj.geometry.mode == "bezier" for obj in augmented.objects)
     assert all(obj.geometry.baseline is not None for obj in augmented.objects)
     assert all(obj.geometry.rotation_degrees == 0 for obj in augmented.objects)
+
+
+def test_structural_noise_transforms_shapes_without_bending(
+    protocol_21_dict: dict,
+) -> None:
+    protocol = DatasetProtocol.model_validate(protocol_21_dict)
+    augmented = apply_structural_noise(
+        protocol,
+        config=_config(
+            group_translation_std_x=0.01,
+            group_translation_std_y=0.01,
+            bend_probability=1.0,
+            bend_min_fraction=0.1,
+            bend_max_fraction=0.1,
+        ),
+        seed=3,
+    )
+
+    shape = next(obj for obj in augmented.objects if obj.object_type == "shape")
+    text = next(obj for obj in augmented.objects if obj.object_type == "text")
+    assert not hasattr(shape.geometry, "mode")
+    assert shape.tight_bbox is None
+    assert text.geometry.mode == "bezier"

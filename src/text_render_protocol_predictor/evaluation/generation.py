@@ -11,8 +11,11 @@ from pydantic import ValidationError
 from ..protocol.schema import (
     BoundingBox,
     LinearGradientFill,
+    PredictionObjectV1,
     PredictionProtocol,
+    PredictionTextObjectV2,
     SolidFill,
+    UnsupportedProtocolVersion,
 )
 
 
@@ -22,6 +25,7 @@ class GenerationValidityMetrics:
     valid_json_count: int
     schema_valid_count: int
     ground_truth_object_count: int = 0
+    ground_truth_text_object_count: int = 0
     semantic_id_true_positive_count: int = 0
     semantic_id_false_positive_count: int = 0
     semantic_id_false_negative_count: int = 0
@@ -70,9 +74,9 @@ class GenerationValidityMetrics:
 
     @property
     def font_accuracy(self) -> float:
-        if self.ground_truth_object_count == 0:
+        if self.ground_truth_text_object_count == 0:
             return 0.0
-        return self.font_correct_count / self.ground_truth_object_count
+        return self.font_correct_count / self.ground_truth_text_object_count
 
     @property
     def bezier_mse(self) -> float:
@@ -124,6 +128,9 @@ class GenerationValidityMetrics:
             metrics.update(
                 {
                     "generation/ground_truth_object_count": self.ground_truth_object_count,
+                    "generation/ground_truth_text_object_count": (
+                        self.ground_truth_text_object_count
+                    ),
                     "generation/box_iou": self.box_iou,
                     "generation/cer": self.character_error_rate,
                     "generation/wer": self.word_error_rate,
@@ -207,12 +214,16 @@ def _parse_prediction(output: str) -> tuple[bool, PredictionProtocol | None]:
         return False, None
     try:
         prediction = PredictionProtocol.model_validate(value)
-    except ValidationError:
+    except (ValidationError, UnsupportedProtocolVersion):
         return True, None
     object_ids = [obj.id for obj in prediction.objects]
     if len(object_ids) != len(set(object_ids)):
         return True, None
     return True, prediction
+
+
+def _is_text_object(value: object) -> bool:
+    return isinstance(value, (PredictionObjectV1, PredictionTextObjectV2))
 
 
 def evaluate_generation_validity(outputs: list[str]) -> GenerationValidityMetrics:
@@ -240,6 +251,7 @@ def evaluate_generation_predictions(
     valid_json = 0
     schema_valid = 0
     ground_truth_objects = 0
+    ground_truth_text_objects = 0
     true_positives = 0
     false_positives = 0
     false_negatives = 0
@@ -257,7 +269,7 @@ def evaluate_generation_predictions(
 
     for output, raw_target in zip(outputs, targets, strict=True):
         target = (
-            raw_target
+            PredictionProtocol.model_validate(raw_target)
             if isinstance(raw_target, PredictionProtocol)
             else PredictionProtocol.model_validate_json(raw_target)
         )
@@ -277,16 +289,19 @@ def evaluate_generation_predictions(
         false_negatives += len(target_ids - prediction_ids)
         exact_matches += int(prediction is not None and target_ids == prediction_ids)
         ground_truth_objects += len(target_ids)
+        ground_truth_text_objects += sum(_is_text_object(obj) for obj in target.objects)
 
         for object_id in target_ids | prediction_ids:
             target_obj = target_by_id.get(object_id)
             prediction_obj = prediction_by_id.get(object_id)
             reference_text = (
-                unicodedata.normalize("NFC", target_obj.text) if target_obj is not None else ""
+                unicodedata.normalize("NFC", target_obj.text)
+                if target_obj is not None and _is_text_object(target_obj)
+                else ""
             )
             predicted_text = (
                 unicodedata.normalize("NFC", prediction_obj.text)
-                if prediction_obj is not None
+                if prediction_obj is not None and _is_text_object(prediction_obj)
                 else ""
             )
             character_errors += _edit_distance(list(reference_text), list(predicted_text))
@@ -301,12 +316,15 @@ def evaluate_generation_predictions(
             box_iou_sum += _box_iou(
                 target_obj.geometry.box, prediction_obj.geometry.box
             )
-            font_correct += int(target_obj.style.font_id == prediction_obj.style.font_id)
+            if _is_text_object(target_obj) and _is_text_object(prediction_obj):
+                font_correct += int(
+                    target_obj.style.font_id == prediction_obj.style.font_id
+                )
 
             # A straight prediction has no curve and is intentionally excluded,
             # as is a straight target for which no ground-truth curve exists.
-            target_baseline = target_obj.geometry.baseline
-            prediction_baseline = prediction_obj.geometry.baseline
+            target_baseline = getattr(target_obj.geometry, "baseline", None)
+            prediction_baseline = getattr(prediction_obj.geometry, "baseline", None)
             if target_baseline is not None and prediction_baseline is not None:
                 for point_name in ("p0", "p1", "p2", "p3"):
                     target_point = getattr(target_baseline, point_name)
@@ -337,6 +355,7 @@ def evaluate_generation_predictions(
         valid_json_count=valid_json,
         schema_valid_count=schema_valid,
         ground_truth_object_count=ground_truth_objects,
+        ground_truth_text_object_count=ground_truth_text_objects,
         semantic_id_true_positive_count=true_positives,
         semantic_id_false_positive_count=false_positives,
         semantic_id_false_negative_count=false_negatives,

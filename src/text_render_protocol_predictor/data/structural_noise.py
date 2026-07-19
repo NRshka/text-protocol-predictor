@@ -11,8 +11,9 @@ from typing import Any, Mapping
 from ..protocol.schema import (
     BezierBaseline,
     BoundingBox,
-    DatasetObject,
     DatasetProtocol,
+    DatasetObjectV1,
+    DatasetTextObjectV20,
     Point,
 )
 
@@ -147,7 +148,7 @@ def _group_name(object_id: str, explicit_groups: Mapping[str, str]) -> str:
     return f"object:{object_id}"
 
 
-def _group_bounds(objects: list[DatasetObject]) -> BoundingBox:
+def _group_bounds(objects: list[Any]) -> BoundingBox:
     left = min(obj.geometry.box.x for obj in objects)
     top = min(obj.geometry.box.y for obj in objects)
     right = max(obj.geometry.box.x + obj.geometry.box.width for obj in objects)
@@ -155,10 +156,11 @@ def _group_bounds(objects: list[DatasetObject]) -> BoundingBox:
     return BoundingBox(x=left, y=top, width=right - left, height=bottom - top)
 
 
-def _transform_object(obj: DatasetObject, affine: _Affine) -> None:
+def _transform_object(obj: Any, affine: _Affine) -> None:
     box = obj.geometry.box
     center = affine.point(Point(x=box.x + box.width / 2, y=box.y + box.height / 2))
-    if obj.geometry.baseline is not None:
+    baseline = getattr(obj.geometry, "baseline", None)
+    if baseline is not None:
         corners = [
             affine.point(Point(x=box.x, y=box.y)),
             affine.point(Point(x=box.x + box.width, y=box.y)),
@@ -175,7 +177,6 @@ def _transform_object(obj: DatasetObject, affine: _Affine) -> None:
             width=right - left,
             height=bottom - top,
         )
-        baseline = obj.geometry.baseline
         obj.geometry.baseline = BezierBaseline(
             p0=affine.point(baseline.p0),
             p1=affine.point(baseline.p1),
@@ -193,7 +194,11 @@ def _transform_object(obj: DatasetObject, affine: _Affine) -> None:
     obj.tight_bbox = None
 
 
-def _bend_object(obj: DatasetObject, rng: random.Random, config: StructuralNoiseConfig) -> None:
+def _bend_object(
+    obj: DatasetObjectV1 | DatasetTextObjectV20,
+    rng: random.Random,
+    config: StructuralNoiseConfig,
+) -> None:
     box = obj.geometry.box
     bend = _signed_magnitude(rng, config.bend_min_fraction, config.bend_max_fraction)
     bend_pixels = bend * box.height
@@ -242,7 +247,7 @@ def apply_structural_noise(
 
     result = protocol.model_copy(deep=True)
     explicit_groups = object_groups or {}
-    groups: dict[str, list[DatasetObject]] = {}
+    groups: dict[str, list[Any]] = {}
     for obj in result.objects:
         groups.setdefault(_group_name(obj.id, explicit_groups), []).append(obj)
 
@@ -294,7 +299,9 @@ def apply_structural_noise(
             * canvas_height,
         )
         _transform_object(obj, local_affine)
-        if rng.random() < config.bend_probability:
+        if isinstance(obj, (DatasetObjectV1, DatasetTextObjectV20)) and (
+            rng.random() < config.bend_probability
+        ):
             _bend_object(obj, rng, config)
 
     return result

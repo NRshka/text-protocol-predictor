@@ -13,11 +13,12 @@ class ManifestEntry(BaseModel):
     sample_id: str = Field(min_length=1)
     image: str = Field(min_length=1)
     protocol: str = Field(min_length=1)
-    seed: int
+    seed: int | None = None
 
     recipe: str | None = None
     template_id: str | None = None
     structural_groups: dict[str, str] | None = None
+    annotation_status: str | None = None
 
 
 def load_manifest(path: str | Path) -> list[ManifestEntry]:

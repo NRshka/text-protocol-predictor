@@ -23,6 +23,14 @@ def test_generation_validity_uses_all_outputs_as_denominator() -> None:
     assert metrics.schema_valid_percent == 100 / 3
 
 
+def test_generation_validity_rejects_future_versions_without_guessing() -> None:
+    future = '{"protocol_version":"3.0","canvas":{"width":1,"height":1},"objects":[]}'
+    metrics = evaluate_generation_validity([future])
+
+    assert metrics.valid_json_count == 1
+    assert metrics.schema_valid_count == 0
+
+
 def test_generation_task_metrics_are_perfect_for_exact_prediction(
     protocol_dict: dict,
 ) -> None:
@@ -130,3 +138,17 @@ def test_duplicate_semantic_ids_are_schema_invalid(protocol_dict: dict) -> None:
     assert metrics.valid_json_count == 1
     assert metrics.schema_valid_count == 0
     assert metrics.semantic_id_exact_match == 0.0
+
+
+def test_version_21_shapes_are_evaluated_without_text_fields(
+    protocol_21_dict: dict,
+) -> None:
+    target = canonicalize(protocol_21_dict)
+    metrics = evaluate_generation_predictions([target], [target])
+
+    assert metrics.schema_valid_count == 1
+    assert metrics.ground_truth_object_count == 2
+    assert metrics.ground_truth_text_object_count == 1
+    assert metrics.box_iou == 1.0
+    assert metrics.font_accuracy == 1.0
+    assert metrics.character_error_rate == 0.0

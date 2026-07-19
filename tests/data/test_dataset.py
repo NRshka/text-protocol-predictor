@@ -50,3 +50,38 @@ def test_dataset_rejects_path_escape(tmp_path) -> None:
     dataset = ProtocolManifestDataset(dataset_root=tmp_path, manifest_path="train.jsonl")
     with pytest.raises(ValueError, match="escapes"):
         _ = dataset[0]
+
+
+def test_version_21_manifest_paths_are_relative_to_manifest_and_seed_is_optional(
+    tmp_path, protocol_21_dict: dict
+) -> None:
+    (tmp_path / "splits").mkdir()
+    (tmp_path / "images").mkdir()
+    (tmp_path / "protocols").mkdir()
+    Image.new("RGB", (1280, 720)).save(tmp_path / "images" / "sample.jpg")
+    (tmp_path / "protocols" / "sample.json").write_text(
+        json.dumps(protocol_21_dict), encoding="utf-8"
+    )
+    (tmp_path / "splits" / "validation.jsonl").write_text(
+        json.dumps(
+            {
+                "sample_id": "sample-21",
+                "image": "../images/sample.jpg",
+                "protocol": "../protocols/sample.json",
+                "annotation_status": "reviewed_bootstrap",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    record = ProtocolManifestDataset(
+        dataset_root=tmp_path,
+        manifest_path="splits/validation.jsonl",
+        font_ids={"Inter"},
+    )[0]
+
+    assert record.protocol_version == "2.1"
+    assert record.purpose == "annotation"
+    assert record.seed == 0
+    assert record.image_path == tmp_path / "images" / "sample.jpg"

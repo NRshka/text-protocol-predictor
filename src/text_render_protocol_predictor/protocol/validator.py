@@ -7,7 +7,12 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from .schema import DatasetProtocol
+from .schema import (
+    DatasetProtocol,
+    PredictionObjectV1,
+    PredictionTextObjectV2,
+    UnsupportedProtocolVersion,
+)
 
 
 class ProtocolValidationError(ValueError):
@@ -20,8 +25,8 @@ def validate_dataset_protocol(
     font_ids: Collection[str] | None = None,
 ) -> DatasetProtocol:
     try:
-        protocol = value if isinstance(value, DatasetProtocol) else DatasetProtocol.model_validate(value)
-    except ValidationError as exc:
+        protocol = DatasetProtocol.model_validate(value)
+    except (ValidationError, UnsupportedProtocolVersion) as exc:
         raise ProtocolValidationError(str(exc)) from exc
 
     ids = [obj.id for obj in protocol.objects]
@@ -29,9 +34,13 @@ def validate_dataset_protocol(
         raise ProtocolValidationError("object identifiers must be unique")
 
     if font_ids is not None:
-        unknown = sorted({obj.style.font_id for obj in protocol.objects} - set(font_ids))
+        text_objects = (
+            obj
+            for obj in protocol.objects
+            if isinstance(obj, (PredictionObjectV1, PredictionTextObjectV2))
+        )
+        unknown = sorted({obj.style.font_id for obj in text_objects} - set(font_ids))
         if unknown:
             raise ProtocolValidationError(f"unknown font identifiers: {', '.join(unknown)}")
 
     return protocol
-

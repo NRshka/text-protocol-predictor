@@ -1,7 +1,9 @@
 import pytest
 
 from text_render_protocol_predictor.protocol import (
+    DatasetProtocolV21,
     ProtocolValidationError,
+    detect_protocol_version,
     validate_dataset_protocol,
 )
 
@@ -27,3 +29,33 @@ def test_straight_baseline_is_explicitly_null(copied_protocol: dict) -> None:
     with pytest.raises(ProtocolValidationError, match="baseline=null"):
         validate_dataset_protocol(copied_protocol)
 
+
+def test_version_21_dispatches_to_its_schema(protocol_21_dict: dict) -> None:
+    protocol = validate_dataset_protocol(protocol_21_dict, font_ids={"Inter"})
+
+    assert isinstance(protocol, DatasetProtocolV21)
+    assert detect_protocol_version(protocol) == "2.1"
+    assert protocol.purpose == "annotation"
+    assert protocol.objects[1].annotation.geometry_confidence == 0.95
+    assert protocol.objects[1].annotation.text_confidence == 1.0
+
+
+def test_version_20_rejects_21_annotation_fields(protocol_21_dict: dict) -> None:
+    protocol_21_dict["protocol_version"] = "2.0"
+    protocol_21_dict["purpose"] = "render"
+    with pytest.raises(ProtocolValidationError, match="annotation"):
+        validate_dataset_protocol(protocol_21_dict)
+
+
+def test_annotation_purpose_requires_version_21(protocol_21_dict: dict) -> None:
+    protocol_21_dict["protocol_version"] = "2.0"
+    for obj in protocol_21_dict["objects"]:
+        obj.pop("annotation", None)
+    with pytest.raises(ProtocolValidationError, match="purpose"):
+        validate_dataset_protocol(protocol_21_dict)
+
+
+def test_unknown_versions_are_not_guessed(protocol_dict: dict) -> None:
+    protocol_dict["protocol_version"] = "3.0"
+    with pytest.raises(ProtocolValidationError, match="unsupported protocol_version"):
+        validate_dataset_protocol(protocol_dict)

@@ -25,6 +25,7 @@ class ProtocolSFTCollator:
                 image=record.image_path,
                 width=record.canvas_width,
                 height=record.canvas_height,
+                protocol_version=getattr(record, "protocol_version", "1.0"),
                 target=record.canonical_protocol,
             )
             for record in records
@@ -34,6 +35,7 @@ class ProtocolSFTCollator:
                 image=record.image_path,
                 width=record.canvas_width,
                 height=record.canvas_height,
+                protocol_version=getattr(record, "protocol_version", "1.0"),
             )
             for record in records
         ]
@@ -132,6 +134,7 @@ class ProtocolGenerationCollator:
                 image=record.image_path,
                 width=record.canvas_width,
                 height=record.canvas_height,
+                protocol_version=getattr(record, "protocol_version", "1.0"),
             )
             for record in records
         ]

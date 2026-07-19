@@ -23,6 +23,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", choices=("auto", "bf16", "fp16", "fp32"), default="auto")
     parser.add_argument("--max-new-tokens", type=int, default=4096)
+    parser.add_argument(
+        "--protocol-version", choices=("1.0", "2.0", "2.1"), default="1.0"
+    )
     parser.add_argument("--image-min-pixels", type=int, default=200704)
     parser.add_argument("--image-max-pixels", type=int, default=1003520)
     parser.add_argument("--output", type=Path, help="Also save the raw generation here")
@@ -72,6 +75,7 @@ def main() -> None:
         image=args.image,
         width=width,
         height=height,
+        protocol_version=args.protocol_version,
     )
     batch = processor.apply_chat_template(
         [conversation],
