@@ -11,6 +11,9 @@ dataset:
   maximum_mask_coverage: 0.75
   num_workers: 4
   preflight_validation: true
+  # Fail preflight if a sample has no usable OCR content. Set false only to
+  # reproduce the legacy pixel-only objective.
+  require_words: true
 
 protocol:
   # Milestone one is text-only: decorations already remain in erased backgrounds.
@@ -36,6 +39,12 @@ reward:
   invalid_semantics_reward: -0.85
   unknown_font_reward: -0.8
   renderer_failure_reward: -0.8
+  # Box-free OCR content reward: 0.7 * recall + 0.3 * precision.
+  word_reward_weight: 0.4
+  word_recall_weight: 0.7
+  word_fuzzy_threshold: 0.8
+  minimum_ocr_confidence: 0.5
+  reject_empty_word_predictions: true
 
 model:
   # Required: final_model (or equivalent) produced by train_sft.py.

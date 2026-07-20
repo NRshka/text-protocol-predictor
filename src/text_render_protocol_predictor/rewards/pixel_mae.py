@@ -1,9 +1,10 @@
-"""Masked pixel-reconstruction reward for rendered protocol completions."""
+"""Rendered pixel reconstruction with an optional box-free OCR word reward."""
 
 from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -11,6 +12,7 @@ import numpy as np
 from PIL import Image, ImageFilter
 
 from ..rendering import RenderStatus
+from .word_content import WordMatchMetrics, match_word_content
 
 
 @dataclass(frozen=True)
@@ -25,6 +27,11 @@ class PixelMAERewardConfig:
     invalid_semantics_reward: float = -0.85
     unknown_font_reward: float = -0.8
     renderer_failure_reward: float = -0.8
+    word_reward_weight: float = 0.4
+    word_recall_weight: float = 0.7
+    word_fuzzy_threshold: float = 0.8
+    minimum_ocr_confidence: float = 0.5
+    reject_empty_word_predictions: bool = True
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.mask_threshold <= 1.0:
@@ -37,6 +44,14 @@ class PixelMAERewardConfig:
             raise ValueError("outside_weight must be non-negative")
         if self.cache_size < 1:
             raise ValueError("cache_size must be positive")
+        if self.word_reward_weight < 0:
+            raise ValueError("word_reward_weight must be non-negative")
+        if not 0.0 <= self.word_recall_weight <= 1.0:
+            raise ValueError("word_recall_weight must be between 0 and 1")
+        if not 0.0 <= self.word_fuzzy_threshold <= 1.0:
+            raise ValueError("word_fuzzy_threshold must be between 0 and 1")
+        if not 0.0 <= self.minimum_ocr_confidence <= 1.0:
+            raise ValueError("minimum_ocr_confidence must be between 0 and 1")
 
 
 @dataclass(frozen=True)
@@ -48,6 +63,13 @@ class RewardBreakdown:
     outside_mae: float | None
     background_masked_mae: float
     restoration_delta: float | None
+    word_precision: float | None = None
+    word_recall: float | None = None
+    word_score: float | None = None
+    reference_word_count: int = 0
+    predicted_word_count: int = 0
+    matched_word_count: int = 0
+    empty_word_prediction: bool | None = None
     error: str | None = None
     rendered_image: Image.Image | None = None
 
@@ -116,14 +138,32 @@ def _completion_text(completion: Any) -> str:
     return "".join(parts)
 
 
+def _extract_prediction_texts(completion: str) -> tuple[str, ...]:
+    """Best-effort fallback for renderers that do not return parsed texts."""
+    try:
+        raw = json.loads(completion)
+    except (json.JSONDecodeError, TypeError):
+        return ()
+    objects = raw.get("objects") if isinstance(raw, dict) else None
+    if not isinstance(objects, list):
+        return ()
+    return tuple(
+        text
+        for item in objects
+        if isinstance(item, dict) and isinstance((text := item.get("text")), str)
+    )
+
+
 class PixelMAEReward:
     """TRL-compatible callable that renders completions and scores reconstruction."""
 
     def __init__(self, renderer: Any, config: PixelMAERewardConfig | None = None) -> None:
-        # TRL names Python reward callables through ``__name__`` for metrics.
-        self.__name__ = "pixel_mae"
-        self.renderer = renderer
         self.config = config or PixelMAERewardConfig()
+        # TRL names Python reward callables through ``__name__`` for metrics.
+        self.__name__ = (
+            "pixel_mae_word" if self.config.word_reward_weight > 0 else "pixel_mae"
+        )
+        self.renderer = renderer
         self._asset_cache: OrderedDict[tuple[str, str, str], _RewardAssets] = OrderedDict()
         self.last_breakdowns: list[RewardBreakdown] = []
         self._failure_rewards = {
@@ -185,8 +225,10 @@ class PixelMAEReward:
         original_path: str | Path,
         background_path: str | Path,
         text_mask_path: str | Path,
+        reference_words: Sequence[Any] | None = None,
     ) -> RewardBreakdown:
         assets = self._load_assets(original_path, background_path, text_mask_path)
+        unavailable_words = self._match_words((), reference_words)
         try:
             completion_text = _completion_text(completion)
         except (TypeError, ValueError) as exc:
@@ -198,6 +240,9 @@ class PixelMAEReward:
                 outside_mae=None,
                 background_masked_mae=assets.background_masked_mae,
                 restoration_delta=None,
+                **self._word_breakdown_kwargs(
+                    unavailable_words, prediction_available=False
+                ),
                 error=str(exc),
             )
 
@@ -206,6 +251,13 @@ class PixelMAEReward:
             assets.background_image.copy(),
             sample_id=sample_id,
         )
+        prediction_available = (
+            outcome.predicted_texts is not None or outcome.status is RenderStatus.OK
+        )
+        predicted_texts = outcome.predicted_texts
+        if predicted_texts is None:
+            predicted_texts = _extract_prediction_texts(completion_text)
+        word_metrics = self._match_words(predicted_texts, reference_words)
         if outcome.status is not RenderStatus.OK or outcome.image is None:
             return RewardBreakdown(
                 sample_id=sample_id,
@@ -215,13 +267,40 @@ class PixelMAEReward:
                 outside_mae=None,
                 background_masked_mae=assets.background_masked_mae,
                 restoration_delta=None,
+                **self._word_breakdown_kwargs(
+                    word_metrics, prediction_available=prediction_available
+                ),
                 error=outcome.error,
+            )
+
+        if (
+            self.config.reject_empty_word_predictions
+            and word_metrics.active
+            and word_metrics.predicted_count == 0
+        ):
+            return RewardBreakdown(
+                sample_id=sample_id,
+                status=RenderStatus.INVALID_SEMANTICS,
+                reward=float(self.config.invalid_semantics_reward),
+                masked_mae=None,
+                outside_mae=None,
+                background_masked_mae=assets.background_masked_mae,
+                restoration_delta=None,
+                **self._word_breakdown_kwargs(
+                    word_metrics, prediction_available=prediction_available
+                ),
+                error=(
+                    "prediction contains no lexical words while the OCR reference "
+                    f"contains {word_metrics.reference_count}"
+                ),
             )
 
         candidate = np.asarray(outcome.image.convert("RGB"), dtype=np.float32) / 255.0
         masked_mae = masked_rgb_mae(candidate, assets.original, assets.mask)
         outside_mae = masked_rgb_mae(candidate, assets.background, 1.0 - assets.mask)
         reward = 1.0 - masked_mae - self.config.outside_weight * outside_mae
+        if word_metrics.score is not None:
+            reward += self.config.word_reward_weight * word_metrics.score
         return RewardBreakdown(
             sample_id=sample_id,
             status=RenderStatus.OK,
@@ -230,8 +309,44 @@ class PixelMAEReward:
             outside_mae=outside_mae,
             background_masked_mae=assets.background_masked_mae,
             restoration_delta=assets.background_masked_mae - masked_mae,
+            **self._word_breakdown_kwargs(
+                word_metrics, prediction_available=prediction_available
+            ),
             rendered_image=outcome.image,
         )
+
+    def _match_words(
+        self,
+        predicted_texts: Sequence[str],
+        reference_words: Sequence[Any] | None,
+    ) -> WordMatchMetrics:
+        return match_word_content(
+            predicted_texts,
+            reference_words,
+            recall_weight=self.config.word_recall_weight,
+            fuzzy_threshold=self.config.word_fuzzy_threshold,
+            minimum_confidence=self.config.minimum_ocr_confidence,
+        )
+
+    @staticmethod
+    def _word_breakdown_kwargs(
+        metrics: WordMatchMetrics,
+        *,
+        prediction_available: bool,
+    ) -> dict[str, Any]:
+        return {
+            "word_precision": metrics.precision,
+            "word_recall": metrics.recall,
+            "word_score": metrics.score,
+            "reference_word_count": metrics.reference_count,
+            "predicted_word_count": metrics.predicted_count,
+            "matched_word_count": metrics.matched_count,
+            "empty_word_prediction": (
+                metrics.predicted_count == 0
+                if metrics.active and prediction_available
+                else None
+            ),
+        }
 
     def __call__(self, completions: Sequence[Any], **kwargs: Any) -> list[float]:
         required = ("sample_id", "original_path", "background_path", "text_mask_path")
@@ -240,9 +355,13 @@ class PixelMAEReward:
             raise ValueError(f"reward call is missing dataset columns: {', '.join(missing)}")
 
         breakdowns: list[RewardBreakdown] = []
-        memo: dict[tuple[str, str, str, str, str], RewardBreakdown] = {}
+        memo: dict[tuple[str, str, str, str, str, str], RewardBreakdown] = {}
         for index, completion in enumerate(completions):
             values = {name: kwargs[name][index] for name in required}
+            reference_columns = kwargs.get("reference_words")
+            values["reference_words"] = (
+                reference_columns[index] if reference_columns is not None else []
+            )
             try:
                 completion_key = _completion_text(completion)
             except TypeError:
@@ -252,6 +371,7 @@ class PixelMAEReward:
                 str(values["original_path"]),
                 str(values["background_path"]),
                 str(values["text_mask_path"]),
+                repr(values["reference_words"]),
                 completion_key,
             )
             breakdown = memo.get(key)

@@ -6,6 +6,7 @@ import pytest
 from PIL import Image
 
 from text_render_protocol_predictor.training.grpo_trainer import (
+    _append_finite_metric,
     _append_rendered_images_to_rows,
     build_hf_grpo_dataset,
     grpo_conversation,
@@ -21,6 +22,7 @@ class Record:
     canvas_width: int = 16
     canvas_height: int = 12
     mask_coverage: float = 0.1
+    words: tuple = ()
 
 
 class Records:
@@ -60,6 +62,7 @@ def test_hf_dataset_exposes_original_to_policy_and_reward_paths(tmp_path):
     assert row["original_path"] == str(paths[0])
     assert row["background_path"] == str(paths[1])
     assert row["text_mask_path"] == str(paths[2])
+    assert row["reference_words"] == []
 
 
 def test_appends_rendered_candidates_to_matching_completion_rows():
@@ -69,3 +72,12 @@ def test_appends_rendered_candidates_to_matching_completion_rows():
 
     assert count == 1
     assert originals == [["original-a", "rendered-a"], ["original-b"]]
+
+
+def test_skips_non_finite_batch_metric_in_epoch_aggregation():
+    metrics = {"reconstruction/masked_mae": [0.2]}
+
+    assert not _append_finite_metric(
+        metrics, "reconstruction/masked_mae", float("nan")
+    )
+    assert metrics["reconstruction/masked_mae"] == [0.2]

@@ -3,6 +3,7 @@ from .grpo_dataset import (
     GRPODatasetRecord,
     GRPOManifestDataset,
     GRPOManifestEntry,
+    OCRWord,
     load_grpo_manifest,
 )
 from .manifest import ManifestEntry, load_manifest
@@ -14,6 +15,7 @@ __all__ = [
     "GRPODatasetRecord",
     "GRPOManifestDataset",
     "GRPOManifestEntry",
+    "OCRWord",
     "ManifestEntry",
     "ProtocolDatasetRecord",
     "ProtocolManifestDataset",

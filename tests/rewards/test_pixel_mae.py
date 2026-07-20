@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 from PIL import Image
@@ -103,3 +105,58 @@ def test_invalid_completion_gets_floor_and_duplicates_render_once(tmp_path):
     assert renderer.calls == 1
     assert reward([[{"role": "assistant", "content": "same"}]] * 2, **kwargs) == [1.0, 1.0]
     assert renderer.calls == 2
+
+
+def test_word_reward_prefers_correct_content_and_rejects_empty_protocol(tmp_path):
+    original, background, paths = _assets(tmp_path)
+    exact_completion = json.dumps(
+        {"objects": [{"text": "SUMMER SALE"}]}, separators=(",", ":")
+    )
+    empty_completion = json.dumps({"objects": []}, separators=(",", ":"))
+    reward = _reward(
+        FakeRenderer(
+            {
+                exact_completion: original,
+                empty_completion: background,
+            }
+        )
+    )
+    common = dict(
+        sample_id="sample",
+        original_path=paths[0],
+        background_path=paths[1],
+        text_mask_path=paths[2],
+        reference_words=[
+            {"text": "summer", "confidence": 0.95},
+            {"text": "sale", "confidence": 0.9},
+        ],
+    )
+
+    exact = reward.score(exact_completion, **common)
+    empty = reward.score(empty_completion, **common)
+
+    assert exact.reward == pytest.approx(1.4)
+    assert exact.word_score == pytest.approx(1.0)
+    assert exact.matched_word_count == 2
+    assert empty.status is RenderStatus.INVALID_SEMANTICS
+    assert empty.reward == pytest.approx(-0.85)
+    assert empty.predicted_word_count == 0
+    assert empty.empty_word_prediction is True
+
+
+def test_no_ocr_words_preserves_pixel_only_reward(tmp_path):
+    original, _, paths = _assets(tmp_path)
+    completion = json.dumps({"objects": []})
+    reward = _reward(FakeRenderer({completion: original}))
+
+    result = reward.score(
+        completion,
+        sample_id="sample",
+        original_path=paths[0],
+        background_path=paths[1],
+        text_mask_path=paths[2],
+    )
+
+    assert result.status is RenderStatus.OK
+    assert result.reward == pytest.approx(1.0)
+    assert result.word_score is None

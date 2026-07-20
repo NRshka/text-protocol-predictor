@@ -29,6 +29,7 @@ class RenderOutcome:
     status: RenderStatus
     image: Image.Image | None = None
     error: str | None = None
+    predicted_texts: tuple[str, ...] | None = None
 
 
 class SyntextPredictionRenderer:
@@ -180,13 +181,18 @@ class SyntextPredictionRenderer:
             return RenderOutcome(RenderStatus.INVALID_SCHEMA, error=str(exc))
 
         semantic_error = self._validate_semantics(prediction, background.size)
+        predicted_texts = tuple(obj.text for obj in prediction.objects)
         if semantic_error is not None:
             status = (
                 RenderStatus.UNKNOWN_FONT
                 if semantic_error.startswith("unknown font_id")
                 else RenderStatus.INVALID_SEMANTICS
             )
-            return RenderOutcome(status, error=semantic_error)
+            return RenderOutcome(
+                status,
+                error=semantic_error,
+                predicted_texts=predicted_texts,
+            )
 
         envelope = {
             "protocol_version": prediction.protocol_version,
@@ -204,5 +210,10 @@ class SyntextPredictionRenderer:
             return RenderOutcome(
                 RenderStatus.RENDERER_FAILURE,
                 error=f"{type(exc).__name__}: {exc}",
+                predicted_texts=predicted_texts,
             )
-        return RenderOutcome(RenderStatus.OK, image=rendered)
+        return RenderOutcome(
+            RenderStatus.OK,
+            image=rendered,
+            predicted_texts=predicted_texts,
+        )

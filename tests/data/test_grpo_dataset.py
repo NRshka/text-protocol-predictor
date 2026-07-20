@@ -13,7 +13,15 @@ def _save_webp(path, *, size=(12, 8), color=0):
     Image.new("L", size, color=color).save(path, format="WEBP", lossless=True)
 
 
-def _dataset(tmp_path, *, mask_color=255, background_size=(12, 8)):
+def _dataset(
+    tmp_path,
+    *,
+    mask_color=255,
+    background_size=(12, 8),
+    words=None,
+    require_words=False,
+    minimum_word_confidence=0.0,
+):
     split = tmp_path / "splits"
     _save_webp(tmp_path / "images" / "original.webp")
     _save_webp(tmp_path / "images" / "background.webp", size=background_size)
@@ -26,6 +34,7 @@ def _dataset(tmp_path, *, mask_color=255, background_size=(12, 8)):
                 "image": "../images/original.webp",
                 "background": "../images/background.webp",
                 "text_mask": "../images/mask.webp",
+                **({"words": words} if words is not None else {}),
             }
         )
         + "\n",
@@ -35,6 +44,8 @@ def _dataset(tmp_path, *, mask_color=255, background_size=(12, 8)):
         dataset_root=tmp_path,
         manifest_path="splits/train.jsonl",
         minimum_mask_coverage=0.01,
+        require_words=require_words,
+        minimum_word_confidence=minimum_word_confidence,
     )
 
 
@@ -60,4 +71,33 @@ def test_rejects_empty_text_mask(tmp_path):
     dataset = _dataset(tmp_path, mask_color=0)
 
     with pytest.raises(ValueError, match="mask coverage"):
+        dataset[0]
+
+
+def test_loads_box_free_ocr_words_and_filters_confidence(tmp_path):
+    record = _dataset(
+        tmp_path,
+        words=[
+            {"text": "SUMMER", "confidence": 0.98},
+            {"text": "uncertain", "confidence": 0.2},
+            {"text": "%", "confidence": 1.0},
+        ],
+        require_words=True,
+        minimum_word_confidence=0.5,
+    )[0]
+
+    assert [(word.text, word.confidence) for word in record.words] == [
+        ("SUMMER", pytest.approx(0.98))
+    ]
+
+
+def test_require_words_rejects_missing_or_low_confidence_ocr(tmp_path):
+    dataset = _dataset(
+        tmp_path,
+        words=[{"text": "uncertain", "confidence": 0.2}],
+        require_words=True,
+        minimum_word_confidence=0.5,
+    )
+
+    with pytest.raises(ValueError, match="has no OCR words"):
         dataset[0]

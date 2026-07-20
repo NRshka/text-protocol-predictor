@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import asdict
 from pathlib import Path
@@ -25,6 +26,14 @@ def _append_rendered_images_to_rows(
             image_row.append(rendered_image)
             appended += 1
     return appended
+
+
+def _append_finite_metric(metric_store: dict[str, list[float]], name: str, value: float) -> bool:
+    """Skip undefined all-invalid batch diagnostics instead of poisoning an epoch mean."""
+    if not math.isfinite(value):
+        return False
+    metric_store.setdefault(name, []).append(value)
+    return True
 
 
 def grpo_conversation(
@@ -75,6 +84,9 @@ def build_hf_grpo_dataset(
                 "canvas_width": record.canvas_width,
                 "canvas_height": record.canvas_height,
                 "mask_coverage": record.mask_coverage,
+                "reference_words": [
+                    word.model_dump(mode="json") for word in record.words
+                ],
             }
         )
     return Dataset.from_list(rows).cast_column("image", DatasetImage(decode=True))
@@ -195,6 +207,22 @@ def train_grpo(
                         item.restoration_delta
                         if item.restoration_delta is not None
                         else float("nan"),
+                        item.word_precision
+                        if item.word_precision is not None
+                        else float("nan"),
+                        item.word_recall
+                        if item.word_recall is not None
+                        else float("nan"),
+                        item.word_score if item.word_score is not None else float("nan"),
+                        float(item.reference_word_count),
+                        float(item.predicted_word_count),
+                        float(item.matched_word_count),
+                        1.0 if item.reference_word_count > 0 else 0.0,
+                        (
+                            float(item.empty_word_prediction)
+                            if item.empty_word_prediction is not None
+                            else float("nan")
+                        ),
                         *(1.0 if item.status is status else 0.0 for status in statuses),
                     ]
                 )
@@ -205,13 +233,21 @@ def train_grpo(
                 "reconstruction/masked_mae",
                 "reconstruction/outside_mae",
                 "reconstruction/restoration_delta",
+                "content/word_precision",
+                "content/word_recall",
+                "content/word_score",
+                "content/reference_word_count",
+                "content/predicted_word_count",
+                "content/matched_word_count",
+                "content/reference_available_rate",
+                "content/empty_prediction_rate",
                 *(f"render_status/{status.value}_rate" for status in statuses),
             ]
             mode_metrics = self._metrics.get(mode)
             metric_store = mode_metrics if isinstance(mode_metrics, dict) else self._metrics
             for column, name in enumerate(names):
                 value = torch.nanmean(gathered[:, column]).item()
-                metric_store.setdefault(name, []).append(value)
+                _append_finite_metric(metric_store, name, value)
             if bool(cfg.grpo.log_completions) and bool(cfg.grpo.log_rendered_images):
                 rendered_images = gather_object(
                     [item.rendered_image for item in breakdowns]

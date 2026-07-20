@@ -6,9 +6,25 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from PIL import Image
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .manifest import resolve_dataset_path
+
+
+class OCRWord(BaseModel):
+    """One box-free OCR word used only by the GRPO content reward."""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    text: str = Field(min_length=1)
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+
+    @field_validator("text")
+    @classmethod
+    def text_must_contain_non_whitespace(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("OCR word text must contain non-whitespace characters")
+        return value
 
 
 class GRPOManifestEntry(BaseModel):
@@ -20,6 +36,7 @@ class GRPOManifestEntry(BaseModel):
     image: str = Field(min_length=1)
     background: str = Field(min_length=1)
     text_mask: str = Field(min_length=1)
+    words: list[OCRWord] = Field(default_factory=list)
 
 
 def load_grpo_manifest(path: str | Path) -> list[GRPOManifestEntry]:
@@ -56,6 +73,7 @@ class GRPODatasetRecord:
     canvas_width: int
     canvas_height: int
     mask_coverage: float
+    words: tuple[OCRWord, ...] = ()
 
 
 class GRPOManifestDataset:
@@ -70,6 +88,8 @@ class GRPOManifestDataset:
         minimum_mask_coverage: float = 1e-5,
         maximum_mask_coverage: float = 1.0,
         require_webp: bool = True,
+        require_words: bool = False,
+        minimum_word_confidence: float = 0.0,
     ) -> None:
         if not 0.0 <= mask_threshold <= 1.0:
             raise ValueError("mask_threshold must be between 0 and 1")
@@ -77,6 +97,8 @@ class GRPOManifestDataset:
             raise ValueError(
                 "mask coverage bounds must satisfy 0 <= minimum <= maximum <= 1"
             )
+        if not 0.0 <= minimum_word_confidence <= 1.0:
+            raise ValueError("minimum_word_confidence must be between 0 and 1")
 
         self.dataset_root = Path(dataset_root).expanduser().resolve()
         manifest = Path(manifest_path)
@@ -93,6 +115,8 @@ class GRPOManifestDataset:
         self.minimum_mask_coverage = float(minimum_mask_coverage)
         self.maximum_mask_coverage = float(maximum_mask_coverage)
         self.require_webp = require_webp
+        self.require_words = bool(require_words)
+        self.minimum_word_confidence = float(minimum_word_confidence)
 
     def __len__(self) -> int:
         return len(self.entries)
@@ -105,6 +129,17 @@ class GRPOManifestDataset:
 
     def __getitem__(self, index: int) -> GRPODatasetRecord:
         entry = self.entries[index]
+        usable_words = tuple(
+            word
+            for word in entry.words
+            if word.confidence >= self.minimum_word_confidence
+            and any(character.isalnum() for character in word.text)
+        )
+        if self.require_words and not usable_words:
+            raise ValueError(
+                f"sample {entry.sample_id!r} has no OCR words with confidence >= "
+                f"{self.minimum_word_confidence:.3f}"
+            )
         image_path = self._resolve_entry_path(entry.image)
         background_path = self._resolve_entry_path(entry.background)
         text_mask_path = self._resolve_entry_path(entry.text_mask)
@@ -150,4 +185,5 @@ class GRPOManifestDataset:
             canvas_width=width,
             canvas_height=height,
             mask_coverage=coverage,
+            words=usable_words,
         )
