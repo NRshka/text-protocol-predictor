@@ -6,6 +6,7 @@ import pytest
 from PIL import Image
 
 from text_render_protocol_predictor.training.grpo_trainer import (
+    _append_rendered_images_to_rows,
     build_hf_grpo_dataset,
     grpo_conversation,
 )
@@ -59,3 +60,12 @@ def test_hf_dataset_exposes_original_to_policy_and_reward_paths(tmp_path):
     assert row["original_path"] == str(paths[0])
     assert row["background_path"] == str(paths[1])
     assert row["text_mask_path"] == str(paths[2])
+
+
+def test_appends_rendered_candidates_to_matching_completion_rows():
+    originals = [["original-a"], ["original-b"]]
+
+    count = _append_rendered_images_to_rows(originals, ["rendered-a", None])
+
+    assert count == 1
+    assert originals == [["original-a", "rendered-a"], ["original-b"]]

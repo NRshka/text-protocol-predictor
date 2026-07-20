@@ -78,6 +78,8 @@ def test_reward_prefers_exact_reconstruction_and_penalizes_outside_changes(tmp_p
     outside = reward.score("outside", **common)
 
     assert exact.reward == pytest.approx(1.0)
+    assert exact.rendered_image is not None
+    assert exact.rendered_image.getpixel((2, 2)) == (255, 255, 255)
     assert empty.reward == pytest.approx(0.0)
     assert exact.restoration_delta == pytest.approx(1.0)
     assert outside.reward == pytest.approx(0.9)

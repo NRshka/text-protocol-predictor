@@ -83,6 +83,8 @@ grpo:
   save_steps: 10
   save_total_limit: 2
   log_completions: true
+  # Each W&B completion row contains [original, rendered] when rendering succeeds.
+  log_rendered_images: true
   use_vllm: false
   output_dir: outputs/grpo-mae
   resume_from: null

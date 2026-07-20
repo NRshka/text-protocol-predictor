@@ -49,6 +49,7 @@ class RewardBreakdown:
     background_masked_mae: float
     restoration_delta: float | None
     error: str | None = None
+    rendered_image: Image.Image | None = None
 
 
 @dataclass(frozen=True)
@@ -229,6 +230,7 @@ class PixelMAEReward:
             outside_mae=outside_mae,
             background_masked_mae=assets.background_masked_mae,
             restoration_delta=assets.background_masked_mae - masked_mae,
+            rendered_image=outcome.image,
         )
 
     def __call__(self, completions: Sequence[Any], **kwargs: Any) -> list[float]:

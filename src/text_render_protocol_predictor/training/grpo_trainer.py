@@ -11,6 +11,22 @@ from typing import Any
 from .prompts import ProtocolPromptTemplate
 
 
+def _append_rendered_images_to_rows(
+    image_rows: Any,
+    rendered_images: list[Any],
+) -> int:
+    """Append candidates to TRL's per-completion ``[original]`` image lists."""
+    if not image_rows or not rendered_images:
+        return 0
+    target_rows = list(image_rows)[-len(rendered_images) :]
+    appended = 0
+    for image_row, rendered_image in zip(target_rows, rendered_images, strict=True):
+        if rendered_image is not None and isinstance(image_row, list):
+            image_row.append(rendered_image)
+            appended += 1
+    return appended
+
+
 def grpo_conversation(
     *,
     width: int,
@@ -143,6 +159,7 @@ def train_grpo(
     renderer_metadata: dict[str, Any],
 ) -> Any:
     import torch
+    from accelerate.utils import gather_object
     from omegaconf import OmegaConf
     from trl import GRPOTrainer
 
@@ -195,6 +212,14 @@ def train_grpo(
             for column, name in enumerate(names):
                 value = torch.nanmean(gathered[:, column]).item()
                 metric_store.setdefault(name, []).append(value)
+            if bool(cfg.grpo.log_completions) and bool(cfg.grpo.log_rendered_images):
+                rendered_images = gather_object(
+                    [item.rendered_image for item in breakdowns]
+                )
+                _append_rendered_images_to_rows(
+                    self._logs.get("images"),
+                    rendered_images,
+                )
             return result
 
     tokenizer = getattr(processor, "tokenizer", None)
