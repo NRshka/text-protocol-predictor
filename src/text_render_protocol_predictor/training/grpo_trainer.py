@@ -151,8 +151,19 @@ def train_grpo(
     class ProtocolGRPOTrainer(GRPOTrainer):
         """Add renderer diagnostics without changing the optimized reward."""
 
-        def _generate_and_score_completions(self, inputs: Any, mode: str) -> Any:
-            result = super()._generate_and_score_completions(inputs, mode)
+        def _generate_and_score_completions(
+            self, inputs: Any, *args: Any, **kwargs: Any
+        ) -> Any:
+            # TRL releases differ here: some pass an explicit `mode`, while
+            # others infer it internally and call this method with only
+            # `inputs`. Forward the exact call shape to remain compatible with
+            # both APIs.
+            result = super()._generate_and_score_completions(inputs, *args, **kwargs)
+            mode = kwargs.get("mode")
+            if mode is None and args:
+                mode = args[0]
+            if mode is None:
+                mode = "train" if self.model.training else "eval"
             breakdowns = reward.last_breakdowns
             if not breakdowns:
                 return result
@@ -179,9 +190,11 @@ def train_grpo(
                 "reconstruction/restoration_delta",
                 *(f"render_status/{status.value}_rate" for status in statuses),
             ]
+            mode_metrics = self._metrics.get(mode)
+            metric_store = mode_metrics if isinstance(mode_metrics, dict) else self._metrics
             for column, name in enumerate(names):
                 value = torch.nanmean(gathered[:, column]).item()
-                self._metrics[mode][name].append(value)
+                metric_store.setdefault(name, []).append(value)
             return result
 
     tokenizer = getattr(processor, "tokenizer", None)
