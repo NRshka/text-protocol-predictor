@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -25,6 +26,14 @@ class FakeRenderer:
         value = self.images.get(completion)
         if isinstance(value, RenderStatus):
             return RenderOutcome(value, error="expected test failure")
+        if isinstance(value, tuple):
+            image, prediction = value
+            return RenderOutcome(
+                RenderStatus.OK,
+                image=image.copy(),
+                predicted_texts=tuple(obj.text for obj in prediction.objects),
+                prediction=prediction,
+            )
         return RenderOutcome(RenderStatus.OK, image=value.copy())
 
 
@@ -160,3 +169,39 @@ def test_no_ocr_words_preserves_pixel_only_reward(tmp_path):
     assert result.status is RenderStatus.OK
     assert result.reward == pytest.approx(1.0)
     assert result.word_score is None
+
+
+def test_layout_iou_is_added_to_valid_pixel_reward(tmp_path):
+    original, _, paths = _assets(tmp_path)
+    geometry = SimpleNamespace(
+        mode="straight",
+        box=SimpleNamespace(x=2, y=2, width=1, height=1),
+        rotation_degrees=0,
+        baseline=None,
+    )
+    prediction = SimpleNamespace(
+        objects=[SimpleNamespace(text="text", geometry=geometry)]
+    )
+    reward = PixelMAEReward(
+        FakeRenderer({"layout": (original, prediction)}),
+        PixelMAERewardConfig(
+            mask_dilation_radius=0,
+            mask_blur_radius=0,
+            layout_dilation_kernel_size=1,
+            layout_dilation_iterations=0,
+        ),
+    )
+
+    result = reward.score(
+        "layout",
+        sample_id="sample",
+        original_path=paths[0],
+        background_path=paths[1],
+        text_mask_path=paths[2],
+    )
+
+    assert result.layout_strict_iou == pytest.approx(1.0)
+    assert result.layout_iou == pytest.approx(1.0)
+    assert result.layout_precision == pytest.approx(1.0)
+    assert result.layout_recall == pytest.approx(1.0)
+    assert result.reward == pytest.approx(1.2)

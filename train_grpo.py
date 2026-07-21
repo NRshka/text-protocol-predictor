@@ -34,6 +34,8 @@ def main(cfg: DictConfig) -> None:
         "minimum_mask_coverage": float(cfg.dataset.minimum_mask_coverage),
         "maximum_mask_coverage": float(cfg.dataset.maximum_mask_coverage),
         "require_webp": bool(cfg.dataset.require_webp),
+        "require_words": bool(cfg.dataset.require_words),
+        "minimum_word_confidence": float(cfg.reward.minimum_ocr_confidence),
     }
     train_source = GRPOManifestDataset(
         manifest_path=cfg.dataset.manifests.train,
@@ -71,6 +73,21 @@ def main(cfg: DictConfig) -> None:
             invalid_semantics_reward=float(cfg.reward.invalid_semantics_reward),
             unknown_font_reward=float(cfg.reward.unknown_font_reward),
             renderer_failure_reward=float(cfg.reward.renderer_failure_reward),
+            word_reward_weight=float(cfg.reward.word_reward_weight),
+            word_recall_weight=float(cfg.reward.word_recall_weight),
+            word_fuzzy_threshold=float(cfg.reward.word_fuzzy_threshold),
+            minimum_ocr_confidence=float(cfg.reward.minimum_ocr_confidence),
+            reject_empty_word_predictions=bool(
+                cfg.reward.reject_empty_word_predictions
+            ),
+            layout_reward_weight=float(cfg.reward.layout_reward_weight),
+            layout_dilation_kernel_size=int(
+                cfg.reward.layout_dilation_kernel_size
+            ),
+            layout_dilation_iterations=int(
+                cfg.reward.layout_dilation_iterations
+            ),
+            layout_bezier_samples=int(cfg.reward.layout_bezier_samples),
         ),
     )
     train_dataset = build_hf_grpo_dataset(

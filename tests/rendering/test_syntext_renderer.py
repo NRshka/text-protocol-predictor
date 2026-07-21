@@ -82,6 +82,7 @@ def test_builds_render_envelope_from_strict_projection():
     assert FakeDocumentProtocol.envelope["sample_id"] == "real-1"
     assert FakeDocumentProtocol.envelope["purpose"] == "render"
     assert FakeDocumentProtocol.envelope["objects"][0]["text"] == "Sale"
+    assert outcome.prediction is not None
 
 
 def test_rejects_json_schema_canvas_and_unknown_font_separately():

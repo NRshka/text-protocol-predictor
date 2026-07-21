@@ -223,6 +223,24 @@ def train_grpo(
                             if item.empty_word_prediction is not None
                             else float("nan")
                         ),
+                        item.layout_strict_iou
+                        if item.layout_strict_iou is not None
+                        else float("nan"),
+                        item.layout_iou
+                        if item.layout_iou is not None
+                        else float("nan"),
+                        item.layout_precision
+                        if item.layout_precision is not None
+                        else float("nan"),
+                        item.layout_recall
+                        if item.layout_recall is not None
+                        else float("nan"),
+                        item.layout_target_coverage
+                        if item.layout_target_coverage is not None
+                        else float("nan"),
+                        item.layout_predicted_coverage
+                        if item.layout_predicted_coverage is not None
+                        else float("nan"),
                         *(1.0 if item.status is status else 0.0 for status in statuses),
                     ]
                 )
@@ -241,6 +259,12 @@ def train_grpo(
                 "content/matched_word_count",
                 "content/reference_available_rate",
                 "content/empty_prediction_rate",
+                "layout/strict_iou",
+                "layout/dilated_iou",
+                "layout/precision",
+                "layout/recall",
+                "layout/dilated_target_coverage",
+                "layout/dilated_predicted_coverage",
                 *(f"render_status/{status.value}_rate" for status in statuses),
             ]
             mode_metrics = self._metrics.get(mode)

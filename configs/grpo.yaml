@@ -45,6 +45,11 @@ reward:
   word_fuzzy_threshold: 0.8
   minimum_ocr_confidence: 0.5
   reject_empty_word_predictions: true
+  # Union of predicted straight boxes / curved bands against the region mask.
+  layout_reward_weight: 0.2
+  layout_dilation_kernel_size: 5
+  layout_dilation_iterations: 3
+  layout_bezier_samples: 129
 
 model:
   # Required: final_model (or equivalent) produced by train_sft.py.

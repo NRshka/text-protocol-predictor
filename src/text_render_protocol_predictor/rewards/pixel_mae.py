@@ -1,4 +1,4 @@
-"""Rendered pixel reconstruction with an optional box-free OCR word reward."""
+"""Composite rendered-pixel, OCR-word, and coarse-layout reward."""
 
 from __future__ import annotations
 
@@ -12,6 +12,13 @@ import numpy as np
 from PIL import Image, ImageFilter
 
 from ..rendering import RenderStatus
+from .layout_iou import (
+    LayoutMaskMetrics,
+    calculate_layout_mask_metrics,
+    dilate_layout_mask,
+    rasterize_protocol_layout_mask,
+    threshold_layout_mask,
+)
 from .word_content import WordMatchMetrics, match_word_content
 
 
@@ -32,6 +39,10 @@ class PixelMAERewardConfig:
     word_fuzzy_threshold: float = 0.8
     minimum_ocr_confidence: float = 0.5
     reject_empty_word_predictions: bool = True
+    layout_reward_weight: float = 0.2
+    layout_dilation_kernel_size: int = 5
+    layout_dilation_iterations: int = 3
+    layout_bezier_samples: int = 129
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.mask_threshold <= 1.0:
@@ -52,6 +63,19 @@ class PixelMAERewardConfig:
             raise ValueError("word_fuzzy_threshold must be between 0 and 1")
         if not 0.0 <= self.minimum_ocr_confidence <= 1.0:
             raise ValueError("minimum_ocr_confidence must be between 0 and 1")
+        if self.layout_reward_weight < 0:
+            raise ValueError("layout_reward_weight must be non-negative")
+        if (
+            self.layout_dilation_kernel_size < 1
+            or self.layout_dilation_kernel_size % 2 == 0
+        ):
+            raise ValueError(
+                "layout_dilation_kernel_size must be a positive odd integer"
+            )
+        if self.layout_dilation_iterations < 0:
+            raise ValueError("layout_dilation_iterations must be non-negative")
+        if self.layout_bezier_samples < 2:
+            raise ValueError("layout_bezier_samples must be at least two")
 
 
 @dataclass(frozen=True)
@@ -70,6 +94,12 @@ class RewardBreakdown:
     predicted_word_count: int = 0
     matched_word_count: int = 0
     empty_word_prediction: bool | None = None
+    layout_strict_iou: float | None = None
+    layout_iou: float | None = None
+    layout_precision: float | None = None
+    layout_recall: float | None = None
+    layout_target_coverage: float | None = None
+    layout_predicted_coverage: float | None = None
     error: str | None = None
     rendered_image: Image.Image | None = None
 
@@ -80,6 +110,8 @@ class _RewardAssets:
     background_image: Image.Image
     background: np.ndarray
     mask: np.ndarray
+    layout_target: np.ndarray
+    layout_target_dilated: np.ndarray
     background_masked_mae: float
 
 
@@ -160,9 +192,10 @@ class PixelMAEReward:
     def __init__(self, renderer: Any, config: PixelMAERewardConfig | None = None) -> None:
         self.config = config or PixelMAERewardConfig()
         # TRL names Python reward callables through ``__name__`` for metrics.
-        self.__name__ = (
-            "pixel_mae_word" if self.config.word_reward_weight > 0 else "pixel_mae"
+        auxiliary_enabled = (
+            self.config.word_reward_weight > 0 or self.config.layout_reward_weight > 0
         )
+        self.__name__ = "reconstruction_composite" if auxiliary_enabled else "pixel_mae"
         self.renderer = renderer
         self._asset_cache: OrderedDict[tuple[str, str, str], _RewardAssets] = OrderedDict()
         self.last_breakdowns: list[RewardBreakdown] = []
@@ -199,6 +232,15 @@ class PixelMAEReward:
                 dilation_radius=self.config.mask_dilation_radius,
                 blur_radius=self.config.mask_blur_radius,
             )
+            layout_target = threshold_layout_mask(
+                image,
+                threshold=self.config.mask_threshold,
+            )
+        layout_target_dilated = dilate_layout_mask(
+            layout_target,
+            kernel_size=self.config.layout_dilation_kernel_size,
+            iterations=self.config.layout_dilation_iterations,
+        )
         if original.shape != background.shape or mask.shape != original.shape[:2]:
             raise ValueError(
                 "reward assets have inconsistent dimensions: "
@@ -209,6 +251,8 @@ class PixelMAEReward:
             background_image=background_image,
             background=background,
             mask=mask,
+            layout_target=layout_target,
+            layout_target_dilated=layout_target_dilated,
             background_masked_mae=masked_rgb_mae(background, original, mask),
         )
         self._asset_cache[key] = assets
@@ -243,6 +287,7 @@ class PixelMAEReward:
                 **self._word_breakdown_kwargs(
                     unavailable_words, prediction_available=False
                 ),
+                **self._layout_breakdown_kwargs(None, assets),
                 error=str(exc),
             )
 
@@ -258,6 +303,17 @@ class PixelMAEReward:
         if predicted_texts is None:
             predicted_texts = _extract_prediction_texts(completion_text)
         word_metrics = self._match_words(predicted_texts, reference_words)
+        # INVALID_SEMANTICS can be returned before geometry safety validation
+        # (for example on a wrong canvas), so never rasterize that prediction.
+        layout_safe_statuses = {
+            RenderStatus.OK,
+            RenderStatus.UNKNOWN_FONT,
+            RenderStatus.RENDERER_FAILURE,
+        }
+        layout_metrics = self._match_layout(
+            outcome.prediction if outcome.status in layout_safe_statuses else None,
+            assets,
+        )
         if outcome.status is not RenderStatus.OK or outcome.image is None:
             return RewardBreakdown(
                 sample_id=sample_id,
@@ -270,6 +326,7 @@ class PixelMAEReward:
                 **self._word_breakdown_kwargs(
                     word_metrics, prediction_available=prediction_available
                 ),
+                **self._layout_breakdown_kwargs(layout_metrics, assets),
                 error=outcome.error,
             )
 
@@ -289,6 +346,7 @@ class PixelMAEReward:
                 **self._word_breakdown_kwargs(
                     word_metrics, prediction_available=prediction_available
                 ),
+                **self._layout_breakdown_kwargs(layout_metrics, assets),
                 error=(
                     "prediction contains no lexical words while the OCR reference "
                     f"contains {word_metrics.reference_count}"
@@ -301,6 +359,8 @@ class PixelMAEReward:
         reward = 1.0 - masked_mae - self.config.outside_weight * outside_mae
         if word_metrics.score is not None:
             reward += self.config.word_reward_weight * word_metrics.score
+        if layout_metrics is not None:
+            reward += self.config.layout_reward_weight * layout_metrics.dilated_iou
         return RewardBreakdown(
             sample_id=sample_id,
             status=RenderStatus.OK,
@@ -312,6 +372,7 @@ class PixelMAEReward:
             **self._word_breakdown_kwargs(
                 word_metrics, prediction_available=prediction_available
             ),
+            **self._layout_breakdown_kwargs(layout_metrics, assets),
             rendered_image=outcome.image,
         )
 
@@ -326,6 +387,26 @@ class PixelMAEReward:
             recall_weight=self.config.word_recall_weight,
             fuzzy_threshold=self.config.word_fuzzy_threshold,
             minimum_confidence=self.config.minimum_ocr_confidence,
+        )
+
+    def _match_layout(
+        self,
+        prediction: Any | None,
+        assets: _RewardAssets,
+    ) -> LayoutMaskMetrics | None:
+        if prediction is None:
+            return None
+        predicted = rasterize_protocol_layout_mask(
+            prediction,
+            canvas_size=assets.background_image.size,
+            bezier_samples=self.config.layout_bezier_samples,
+        )
+        return calculate_layout_mask_metrics(
+            predicted,
+            assets.layout_target,
+            dilation_kernel_size=self.config.layout_dilation_kernel_size,
+            dilation_iterations=self.config.layout_dilation_iterations,
+            dilated_target=assets.layout_target_dilated,
         )
 
     @staticmethod
@@ -346,6 +427,30 @@ class PixelMAEReward:
                 if metrics.active and prediction_available
                 else None
             ),
+        }
+
+    @staticmethod
+    def _layout_breakdown_kwargs(
+        metrics: LayoutMaskMetrics | None,
+        assets: _RewardAssets,
+    ) -> dict[str, Any]:
+        if metrics is None:
+            return {
+                "layout_strict_iou": None,
+                "layout_iou": None,
+                "layout_precision": None,
+                "layout_recall": None,
+                "layout_target_coverage": float(assets.layout_target_dilated.mean()),
+                "layout_predicted_coverage": None,
+            }
+        area = assets.layout_target.size
+        return {
+            "layout_strict_iou": metrics.strict_iou,
+            "layout_iou": metrics.dilated_iou,
+            "layout_precision": metrics.precision,
+            "layout_recall": metrics.recall,
+            "layout_target_coverage": metrics.target_pixels / area,
+            "layout_predicted_coverage": metrics.predicted_pixels / area,
         }
 
     def __call__(self, completions: Sequence[Any], **kwargs: Any) -> list[float]:

@@ -30,6 +30,7 @@ class RenderOutcome:
     image: Image.Image | None = None
     error: str | None = None
     predicted_texts: tuple[str, ...] | None = None
+    prediction: Any | None = None
 
 
 class SyntextPredictionRenderer:
@@ -192,6 +193,7 @@ class SyntextPredictionRenderer:
                 status,
                 error=semantic_error,
                 predicted_texts=predicted_texts,
+                prediction=prediction,
             )
 
         envelope = {
@@ -211,9 +213,11 @@ class SyntextPredictionRenderer:
                 RenderStatus.RENDERER_FAILURE,
                 error=f"{type(exc).__name__}: {exc}",
                 predicted_texts=predicted_texts,
+                prediction=prediction,
             )
         return RenderOutcome(
             RenderStatus.OK,
             image=rendered,
             predicted_texts=predicted_texts,
+            prediction=prediction,
         )
