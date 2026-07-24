@@ -50,10 +50,9 @@ class SyntextPredictionRenderer:
         max_font_size: float = 2048.0,
         max_geometry_scale: float = 2.0,
     ) -> None:
-        if protocol_version != "1.0":
+        if protocol_version not in {"1.0", "2.1"}:
             raise ValueError(
-                "reconstruction GRPO currently requires protocol 1.0: erased-text "
-                "backgrounds already retain non-text shapes"
+                "reconstruction GRPO supports protocol 1.0 or text-only protocol 2.1"
             )
         if not font_paths:
             raise ValueError("renderer.font_paths must contain at least one font path")
@@ -108,7 +107,14 @@ class SyntextPredictionRenderer:
         object_ids = [obj.id for obj in prediction.objects]
         if len(object_ids) != len(set(object_ids)):
             return "prediction contains duplicate object IDs"
-        total_characters = sum(len(obj.text) for obj in prediction.objects)
+        non_text_ids = [obj.id for obj in prediction.objects if not hasattr(obj, "text")]
+        if non_text_ids:
+            return (
+                "shape objects are not allowed in reconstruction GRPO because non-text "
+                f"graphics remain in the erased background: {', '.join(non_text_ids[:5])}"
+            )
+        text_objects = [obj for obj in prediction.objects if hasattr(obj, "text")]
+        total_characters = sum(len(obj.text) for obj in text_objects)
         if total_characters > self.max_text_characters:
             return (
                 f"prediction has {total_characters} text characters; maximum is "
@@ -117,10 +123,10 @@ class SyntextPredictionRenderer:
         width, height = canvas_size
         maximum_dimension = max(width, height)
         font_limit = min(self.max_font_size, maximum_dimension * self.max_geometry_scale)
-        oversized = [obj.id for obj in prediction.objects if obj.style.font_size > font_limit]
+        oversized = [obj.id for obj in text_objects if obj.style.font_size > font_limit]
         if oversized:
             return f"font_size exceeds {font_limit} for objects: {', '.join(oversized[:5])}"
-        for obj in prediction.objects:
+        for obj in text_objects:
             box = obj.geometry.box
             if (
                 abs(box.x) > maximum_dimension * self.max_geometry_scale
@@ -160,7 +166,7 @@ class SyntextPredictionRenderer:
                 )
             ):
                 return f"style effects exceed safe rendering bounds for object {obj.id!r}"
-        unknown = sorted({obj.style.font_id for obj in prediction.objects} - self.font_ids)
+        unknown = sorted({obj.style.font_id for obj in text_objects} - self.font_ids)
         if unknown:
             return f"unknown font_id values: {', '.join(unknown[:10])}"
         return None
@@ -182,7 +188,9 @@ class SyntextPredictionRenderer:
             return RenderOutcome(RenderStatus.INVALID_SCHEMA, error=str(exc))
 
         semantic_error = self._validate_semantics(prediction, background.size)
-        predicted_texts = tuple(obj.text for obj in prediction.objects)
+        predicted_texts = tuple(
+            obj.text for obj in prediction.objects if hasattr(obj, "text")
+        )
         if semantic_error is not None:
             status = (
                 RenderStatus.UNKNOWN_FONT

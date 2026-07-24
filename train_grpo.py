@@ -22,10 +22,9 @@ def main(cfg: DictConfig) -> None:
         )
     if not bool(cfg.lora.enabled):
         raise ValueError("GRPO from SFT PEFT weights requires lora.enabled=true")
-    if str(cfg.protocol.version) != "1.0":
+    if str(cfg.protocol.version) not in {"1.0", "2.1"}:
         raise ValueError(
-            "the erased-text milestone supports protocol 1.0 only because non-text shapes "
-            "remain in the background"
+            "the erased-text milestone supports protocol 1.0 or text-only protocol 2.1"
         )
 
     dataset_kwargs = {

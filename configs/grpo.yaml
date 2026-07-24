@@ -16,8 +16,9 @@ dataset:
   require_words: true
 
 protocol:
-  # Milestone one is text-only: decorations already remain in erased backgrounds.
-  version: "1.0"
+  # Keep the policy aligned with 2.1 SFT while requesting text objects only:
+  # decorations already remain in erased backgrounds.
+  version: "2.1"
   max_objects: 64
 
 renderer:

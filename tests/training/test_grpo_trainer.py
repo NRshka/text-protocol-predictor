@@ -38,10 +38,12 @@ class Records:
 
 
 def test_grpo_conversation_leaves_image_in_separate_dataset_column():
-    messages = grpo_conversation(width=16, height=12, protocol_version="1.0")
+    messages = grpo_conversation(width=16, height=12, protocol_version="2.1")
 
     assert [message["role"] for message in messages] == ["system", "user"]
     assert "Canvas size: 16 x 12" in messages[1]["content"]
+    assert "Use protocol version 2.1" in messages[1]["content"]
+    assert "Do not include shape objects" in messages[1]["content"]
     assert isinstance(messages[1]["content"], str)
 
 
@@ -54,7 +56,7 @@ def test_hf_dataset_exposes_original_to_policy_and_reward_paths(tmp_path):
         paths.append(path)
     dataset = build_hf_grpo_dataset(
         Records(Record("sample", *paths)),
-        protocol_version="1.0",
+        protocol_version="2.1",
     )
 
     row = dataset[0]
@@ -63,6 +65,8 @@ def test_hf_dataset_exposes_original_to_policy_and_reward_paths(tmp_path):
     assert row["background_path"] == str(paths[1])
     assert row["text_mask_path"] == str(paths[2])
     assert row["reference_words"] == []
+    assert "Use protocol version 2.1" in row["prompt"][1]["content"]
+    assert "Do not include shape objects" in row["prompt"][1]["content"]
 
 
 def test_appends_rendered_candidates_to_matching_completion_rows():

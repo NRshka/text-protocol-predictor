@@ -49,7 +49,12 @@ def grpo_conversation(
         {"role": "system", "content": template.system},
         {
             "role": "user",
-            "content": template.user_text(width, height, protocol_version),
+            "content": template.user_text(
+                width,
+                height,
+                protocol_version,
+                text_only=True,
+            ),
         },
     ]
 

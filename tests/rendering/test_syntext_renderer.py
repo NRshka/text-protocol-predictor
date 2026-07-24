@@ -7,9 +7,9 @@ from PIL import Image
 from text_render_protocol_predictor.rendering import RenderStatus, SyntextPredictionRenderer
 
 
-def _prediction(font_id="Inter"):
-    return {
-        "protocol_version": "1.0",
+def _prediction(font_id="Inter", protocol_version="1.0"):
+    prediction = {
+        "protocol_version": protocol_version,
         "canvas": {"width": 32, "height": 24},
         "objects": [
             {
@@ -40,6 +40,9 @@ def _prediction(font_id="Inter"):
             }
         ],
     }
+    if protocol_version == "2.1":
+        prediction["objects"][0]["object_type"] = "text"
+    return prediction
 
 
 class FakeDocumentProtocol:
@@ -56,9 +59,9 @@ class FakeProtocolRenderer:
         return background.copy(), protocol
 
 
-def _renderer_without_syntext():
+def _renderer_without_syntext(protocol_version="1.0"):
     renderer = object.__new__(SyntextPredictionRenderer)
-    renderer.protocol_version = "1.0"
+    renderer.protocol_version = protocol_version
     renderer.max_objects = 64
     renderer.max_text_characters = 4096
     renderer.max_font_size = 2048
@@ -101,3 +104,51 @@ def test_rejects_json_schema_canvas_and_unknown_font_separately():
         renderer.render_prediction(json.dumps(_prediction("missing")), background, sample_id="x").status
         is RenderStatus.UNKNOWN_FONT
     )
+
+
+def test_renders_text_only_protocol_21():
+    renderer = _renderer_without_syntext("2.1")
+
+    outcome = renderer.render_prediction(
+        json.dumps(_prediction(protocol_version="2.1")),
+        Image.new("RGB", (32, 24)),
+        sample_id="real-21",
+    )
+
+    assert outcome.status is RenderStatus.OK
+    assert FakeDocumentProtocol.envelope["protocol_version"] == "2.1"
+    assert FakeDocumentProtocol.envelope["objects"][0]["object_type"] == "text"
+
+
+def test_rejects_protocol_21_shape_objects():
+    renderer = _renderer_without_syntext("2.1")
+    prediction = _prediction(protocol_version="2.1")
+    prediction["objects"].append(
+        {
+            "object_type": "shape",
+            "id": "panel",
+            "shape": "rectangle",
+            "geometry": {
+                "box": {"x": 1, "y": 1, "width": 30, "height": 10},
+                "rotation_degrees": 0,
+                "corner_radius": 2,
+            },
+            "style": {
+                "fill": {"type": "solid", "color": "#102030FF"},
+                "stroke": {"width": 0, "color": "#00000000"},
+                "shadow": None,
+            },
+            "z_order": -1,
+        }
+    )
+
+    outcome = renderer.render_prediction(
+        json.dumps(prediction),
+        Image.new("RGB", (32, 24)),
+        sample_id="shape",
+    )
+
+    assert outcome.status is RenderStatus.INVALID_SEMANTICS
+    assert outcome.error is not None
+    assert "shape objects are not allowed" in outcome.error
+    assert outcome.predicted_texts == ("Sale",)

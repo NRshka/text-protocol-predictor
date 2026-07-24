@@ -12,15 +12,30 @@ class ProtocolPromptTemplate:
     version: str = "1.0.0"
     system: str = "You extract editable text rendering protocols from images."
 
-    def user_text(self, width: int, height: int, protocol_version: str = "1.0") -> str:
+    def user_text(
+        self,
+        width: int,
+        height: int,
+        protocol_version: str = "1.0",
+        *,
+        text_only: bool = False,
+    ) -> str:
         object_description = (
-            "text objects" if protocol_version == "1.0" else "text and shape objects"
+            "text objects"
+            if text_only or protocol_version == "1.0"
+            else "text and shape objects"
+        )
+        shape_instruction = (
+            'Do not include shape objects; every object must have object_type "text".\n'
+            if text_only and protocol_version != "1.0"
+            else ""
         )
         return (
             f"Extract all visible {object_description} from the image and return their editable "
             "rendering protocol.\n"
             "Return valid JSON only.\n"
             f"Use protocol version {protocol_version}.\n"
+            f"{shape_instruction}"
             f"Canvas size: {width} x {height}.\n"
             "Coordinates and font sizes must use original canvas pixels.\n"
             "Do not include explanations or Markdown."
