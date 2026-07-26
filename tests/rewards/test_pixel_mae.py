@@ -88,13 +88,14 @@ def test_reward_prefers_exact_reconstruction_and_penalizes_outside_changes(tmp_p
     empty = reward.score("empty", **common)
     outside = reward.score("outside", **common)
 
-    assert exact.reward == pytest.approx(1.0)
+    assert exact.reward == pytest.approx(0.35)
     assert exact.rendered_image is not None
     assert exact.rendered_image.getpixel((2, 2)) == (255, 255, 255)
-    assert empty.reward == pytest.approx(0.0)
+    assert exact.reward > empty.reward
+    assert exact.reward > outside.reward
     assert exact.restoration_delta == pytest.approx(1.0)
-    assert outside.reward == pytest.approx(0.9)
     assert outside.outside_mae == pytest.approx(1.0)
+    assert outside.outside_penalty_component == pytest.approx(0.1)
 
 
 def test_invalid_completion_gets_floor_and_duplicates_render_once(tmp_path):
@@ -112,7 +113,10 @@ def test_invalid_completion_gets_floor_and_duplicates_render_once(tmp_path):
 
     assert reward(["bad", "bad"], **kwargs) == [-0.9, -0.9]
     assert renderer.calls == 1
-    assert reward([[{"role": "assistant", "content": "same"}]] * 2, **kwargs) == [1.0, 1.0]
+    assert reward([[{"role": "assistant", "content": "same"}]] * 2, **kwargs) == [
+        0.35,
+        0.35,
+    ]
     assert renderer.calls == 2
 
 
@@ -144,7 +148,7 @@ def test_word_reward_prefers_correct_content_and_rejects_empty_protocol(tmp_path
     exact = reward.score(exact_completion, **common)
     empty = reward.score(empty_completion, **common)
 
-    assert exact.reward == pytest.approx(1.4)
+    assert exact.reward == pytest.approx(0.7)
     assert exact.word_score == pytest.approx(1.0)
     assert exact.matched_word_count == 2
     assert empty.status is RenderStatus.INVALID_SEMANTICS
@@ -167,7 +171,7 @@ def test_no_ocr_words_preserves_pixel_only_reward(tmp_path):
     )
 
     assert result.status is RenderStatus.OK
-    assert result.reward == pytest.approx(1.0)
+    assert result.reward == pytest.approx(0.35)
     assert result.word_score is None
 
 
@@ -204,4 +208,137 @@ def test_layout_iou_is_added_to_valid_pixel_reward(tmp_path):
     assert result.layout_iou == pytest.approx(1.0)
     assert result.layout_precision == pytest.approx(1.0)
     assert result.layout_recall == pytest.approx(1.0)
-    assert result.reward == pytest.approx(1.2)
+    assert result.reward == pytest.approx(0.65)
+
+
+def test_structured_reward_components_and_fine_gate(tmp_path):
+    original, _, paths = _assets(tmp_path)
+    geometry = SimpleNamespace(
+        mode="straight",
+        box=SimpleNamespace(x=2, y=2, width=1, height=1),
+        rotation_degrees=0,
+        baseline=None,
+    )
+    correct_prediction = SimpleNamespace(
+        objects=[
+            SimpleNamespace(text="SALE", geometry=geometry),
+        ]
+    )
+    wrong_prediction = SimpleNamespace(
+        objects=[
+            SimpleNamespace(text="WRONG", geometry=geometry),
+        ]
+    )
+    reward = _reward(
+        FakeRenderer(
+            {
+                "correct": (original, correct_prediction),
+                "wrong": (original, wrong_prediction),
+            }
+        )
+    )
+    common = dict(
+        sample_id="sample",
+        original_path=paths[0],
+        background_path=paths[1],
+        text_mask_path=paths[2],
+        reference_words=[{"text": "sale", "confidence": 1.0}],
+    )
+
+    correct = reward.score("correct", **common)
+    wrong = reward.score("wrong", **common)
+
+    assert correct.reward == pytest.approx(1.0)
+    assert correct.word_reward_component == pytest.approx(0.35)
+    assert correct.layout_reward_component == pytest.approx(0.30)
+    assert correct.coarse_visual_reward_component == pytest.approx(0.25)
+    assert correct.fine_visual_reward_component == pytest.approx(0.10)
+    assert correct.fine_visual_gate == pytest.approx(1.0)
+    assert wrong.word_score == pytest.approx(0.0)
+    assert wrong.fine_visual_gate == pytest.approx(0.0)
+    assert wrong.fine_visual_reward_component == pytest.approx(0.0)
+    assert wrong.reward == pytest.approx(0.55)
+
+
+def test_multiscale_reward_ranks_nearby_shift_above_missing_text(tmp_path):
+    original = Image.new("RGB", (9, 9), "black")
+    original.putpixel((4, 4), (255, 255, 255))
+    background = Image.new("RGB", (9, 9), "black")
+    shifted = background.copy()
+    shifted.putpixel((5, 4), (255, 255, 255))
+    mask = Image.new("L", (9, 9), 0)
+    mask.putpixel((4, 4), 255)
+    paths = []
+    for name, image in (
+        ("original", original),
+        ("background", background),
+        ("mask", mask),
+    ):
+        path = tmp_path / f"{name}.webp"
+        image.save(path, format="WEBP", lossless=True)
+        paths.append(path)
+    reward = PixelMAEReward(
+        FakeRenderer({"exact": original, "shifted": shifted, "missing": background}),
+        PixelMAERewardConfig(
+            mask_dilation_radius=0,
+            mask_blur_radius=0,
+            outside_weight=0,
+            word_reward_weight=0,
+            layout_reward_weight=0,
+            coarse_visual_reward_weight=1,
+            fine_visual_reward_weight=0,
+            multiscale_downsample_factors=(1,),
+            multiscale_blur_radii=(2,),
+            multiscale_weights=(1,),
+        ),
+    )
+    common = dict(
+        sample_id="sample",
+        original_path=paths[0],
+        background_path=paths[1],
+        text_mask_path=paths[2],
+    )
+
+    exact = reward.score("exact", **common)
+    nearby = reward.score("shifted", **common)
+    missing = reward.score("missing", **common)
+
+    assert nearby.masked_mae == pytest.approx(missing.masked_mae)
+    assert exact.multiscale_mae == pytest.approx(0.0)
+    assert nearby.multiscale_mae < missing.multiscale_mae
+    assert exact.reward > nearby.reward > missing.reward
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        (
+            {
+                "multiscale_downsample_factors": (4, 2),
+                "multiscale_blur_radii": (5,),
+                "multiscale_weights": (1,),
+            },
+            "equal length",
+        ),
+        (
+            {
+                "multiscale_downsample_factors": (0,),
+                "multiscale_blur_radii": (0,),
+                "multiscale_weights": (1,),
+            },
+            "positive integers",
+        ),
+        (
+            {
+                "multiscale_downsample_factors": (1,),
+                "multiscale_blur_radii": (-1,),
+                "multiscale_weights": (1,),
+            },
+            "non-negative",
+        ),
+        ({"multiscale_weights": (0, 0, 0)}, "positive"),
+    ],
+)
+def test_multiscale_config_validation(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        PixelMAERewardConfig(**kwargs)

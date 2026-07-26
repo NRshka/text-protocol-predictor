@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 import json
+import math
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -34,15 +35,23 @@ class PixelMAERewardConfig:
     invalid_semantics_reward: float = -0.85
     unknown_font_reward: float = -0.8
     renderer_failure_reward: float = -0.8
-    word_reward_weight: float = 0.4
+    # Structured reward weights sum to one by default. Fine visual similarity
+    # is gated by word/layout quality; coarse similarity remains available for
+    # partially correct candidates.
+    word_reward_weight: float = 0.35
     word_recall_weight: float = 0.7
     word_fuzzy_threshold: float = 0.8
     minimum_ocr_confidence: float = 0.5
     reject_empty_word_predictions: bool = True
-    layout_reward_weight: float = 0.2
+    layout_reward_weight: float = 0.30
     layout_dilation_kernel_size: int = 5
     layout_dilation_iterations: int = 3
     layout_bezier_samples: int = 129
+    coarse_visual_reward_weight: float = 0.25
+    fine_visual_reward_weight: float = 0.10
+    multiscale_downsample_factors: tuple[int, ...] = (4, 2, 1)
+    multiscale_blur_radii: tuple[float, ...] = (5.0, 2.0, 0.0)
+    multiscale_weights: tuple[float, ...] = (0.5, 0.3, 0.2)
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.mask_threshold <= 1.0:
@@ -65,6 +74,36 @@ class PixelMAERewardConfig:
             raise ValueError("minimum_ocr_confidence must be between 0 and 1")
         if self.layout_reward_weight < 0:
             raise ValueError("layout_reward_weight must be non-negative")
+        if self.coarse_visual_reward_weight < 0:
+            raise ValueError("coarse_visual_reward_weight must be non-negative")
+        if self.fine_visual_reward_weight < 0:
+            raise ValueError("fine_visual_reward_weight must be non-negative")
+        component_weight = (
+            self.word_reward_weight
+            + self.layout_reward_weight
+            + self.coarse_visual_reward_weight
+            + self.fine_visual_reward_weight
+        )
+        if component_weight <= 0:
+            raise ValueError("at least one structured reward weight must be positive")
+        scale_lengths = {
+            len(self.multiscale_downsample_factors),
+            len(self.multiscale_blur_radii),
+            len(self.multiscale_weights),
+        }
+        if len(scale_lengths) != 1 or not self.multiscale_weights:
+            raise ValueError(
+                "multiscale factors, blur radii, and weights must be non-empty "
+                "sequences of equal length"
+            )
+        if any(factor < 1 for factor in self.multiscale_downsample_factors):
+            raise ValueError("multiscale downsample factors must be positive integers")
+        if any(radius < 0 for radius in self.multiscale_blur_radii):
+            raise ValueError("multiscale blur radii must be non-negative")
+        if any(weight < 0 for weight in self.multiscale_weights):
+            raise ValueError("multiscale weights must be non-negative")
+        if sum(self.multiscale_weights) <= 0:
+            raise ValueError("at least one multiscale weight must be positive")
         if (
             self.layout_dilation_kernel_size < 1
             or self.layout_dilation_kernel_size % 2 == 0
@@ -87,6 +126,17 @@ class RewardBreakdown:
     outside_mae: float | None
     background_masked_mae: float
     restoration_delta: float | None
+    multiscale_mae: float | None = None
+    background_multiscale_mae: float | None = None
+    multiscale_restoration_delta: float | None = None
+    coarse_visual_score: float | None = None
+    fine_visual_score: float | None = None
+    fine_visual_gate: float | None = None
+    word_reward_component: float | None = None
+    layout_reward_component: float | None = None
+    coarse_visual_reward_component: float | None = None
+    fine_visual_reward_component: float | None = None
+    outside_penalty_component: float | None = None
     word_precision: float | None = None
     word_recall: float | None = None
     word_score: float | None = None
@@ -113,6 +163,17 @@ class _RewardAssets:
     layout_target: np.ndarray
     layout_target_dilated: np.ndarray
     background_masked_mae: float
+    multiscale_levels: tuple["_MultiScaleLevel", ...]
+    background_multiscale_mae: float
+
+
+@dataclass(frozen=True)
+class _MultiScaleLevel:
+    downsample_factor: int
+    blur_radius: float
+    weight: float
+    target: np.ndarray
+    mask: np.ndarray
 
 
 def prepare_text_mask(
@@ -147,6 +208,141 @@ def masked_rgb_mae(candidate: np.ndarray, target: np.ndarray, mask: np.ndarray) 
         return 0.0
     per_pixel = np.abs(candidate - target).mean(axis=2)
     return float((per_pixel * mask).sum() / weight)
+
+
+def _multiscale_size(size: tuple[int, int], downsample_factor: int) -> tuple[int, int]:
+    width, height = size
+    return (
+        max(1, math.ceil(width / downsample_factor)),
+        max(1, math.ceil(height / downsample_factor)),
+    )
+
+
+def _transform_multiscale_rgb(
+    image: Image.Image,
+    *,
+    downsample_factor: int,
+    blur_radius: float,
+) -> np.ndarray:
+    transformed = image.convert("RGB")
+    if blur_radius:
+        transformed = transformed.filter(ImageFilter.GaussianBlur(blur_radius))
+    target_size = _multiscale_size(transformed.size, downsample_factor)
+    if transformed.size != target_size:
+        transformed = transformed.resize(target_size, Image.Resampling.BOX)
+    return np.asarray(transformed, dtype=np.float32) / 255.0
+
+
+def _transform_multiscale_mask(
+    mask: np.ndarray,
+    *,
+    source_size: tuple[int, int],
+    downsample_factor: int,
+) -> np.ndarray:
+    encoded = Image.fromarray(
+        np.rint(np.clip(mask, 0.0, 1.0) * 255.0).astype(np.uint8)
+    )
+    if encoded.size != source_size:
+        raise ValueError(
+            f"mask size {encoded.size} does not match source image size {source_size}"
+        )
+    target_size = _multiscale_size(source_size, downsample_factor)
+    if encoded.size != target_size:
+        encoded = encoded.resize(target_size, Image.Resampling.BOX)
+    return np.asarray(encoded, dtype=np.float32) / 255.0
+
+
+def _build_multiscale_levels(
+    original: Image.Image,
+    original_array: np.ndarray,
+    background: Image.Image,
+    mask: np.ndarray,
+    config: PixelMAERewardConfig,
+) -> tuple[tuple[_MultiScaleLevel, ...], float]:
+    weight_sum = float(sum(config.multiscale_weights))
+    levels = []
+    background_mae = 0.0
+    for factor, blur_radius, raw_weight in zip(
+        config.multiscale_downsample_factors,
+        config.multiscale_blur_radii,
+        config.multiscale_weights,
+        strict=True,
+    ):
+        factor = int(factor)
+        blur_radius = float(blur_radius)
+        weight = float(raw_weight) / weight_sum
+        target = (
+            original_array
+            if factor == 1 and blur_radius == 0
+            else _transform_multiscale_rgb(
+                original,
+                downsample_factor=factor,
+                blur_radius=blur_radius,
+            )
+        )
+        level_mask = (
+            mask
+            if factor == 1
+            else _transform_multiscale_mask(
+                mask,
+                source_size=original.size,
+                downsample_factor=factor,
+            )
+        )
+        transformed_background = _transform_multiscale_rgb(
+            background,
+            downsample_factor=factor,
+            blur_radius=blur_radius,
+        )
+        background_mae += weight * masked_rgb_mae(
+            transformed_background,
+            target,
+            level_mask,
+        )
+        levels.append(
+            _MultiScaleLevel(
+                downsample_factor=factor,
+                blur_radius=blur_radius,
+                weight=weight,
+                target=target,
+                mask=level_mask,
+            )
+        )
+    return tuple(levels), float(background_mae)
+
+
+def _score_multiscale_mae(
+    candidate: Image.Image,
+    levels: Sequence[_MultiScaleLevel],
+    *,
+    candidate_array: np.ndarray | None = None,
+) -> float:
+    """Compare candidate and target after identical blur/downsample transforms.
+
+    With a common erased background this measures the rendered-text residual
+    against the original-text residual, without materializing signed images.
+    """
+    total = 0.0
+    for level in levels:
+        transformed = (
+            candidate_array
+            if (
+                candidate_array is not None
+                and level.downsample_factor == 1
+                and level.blur_radius == 0
+            )
+            else _transform_multiscale_rgb(
+                candidate,
+                downsample_factor=level.downsample_factor,
+                blur_radius=level.blur_radius,
+            )
+        )
+        total += level.weight * masked_rgb_mae(
+            transformed,
+            level.target,
+            level.mask,
+        )
+    return float(total)
 
 
 def _completion_text(completion: Any) -> str:
@@ -192,10 +388,18 @@ class PixelMAEReward:
     def __init__(self, renderer: Any, config: PixelMAERewardConfig | None = None) -> None:
         self.config = config or PixelMAERewardConfig()
         # TRL names Python reward callables through ``__name__`` for metrics.
-        auxiliary_enabled = (
-            self.config.word_reward_weight > 0 or self.config.layout_reward_weight > 0
+        component_count = sum(
+            weight > 0
+            for weight in (
+                self.config.word_reward_weight,
+                self.config.layout_reward_weight,
+                self.config.coarse_visual_reward_weight,
+                self.config.fine_visual_reward_weight,
+            )
         )
-        self.__name__ = "reconstruction_composite" if auxiliary_enabled else "pixel_mae"
+        self.__name__ = (
+            "reconstruction_composite" if component_count > 1 else "pixel_mae"
+        )
         self.renderer = renderer
         self._asset_cache: OrderedDict[tuple[str, str, str], _RewardAssets] = OrderedDict()
         self.last_breakdowns: list[RewardBreakdown] = []
@@ -246,6 +450,13 @@ class PixelMAEReward:
                 "reward assets have inconsistent dimensions: "
                 f"original={original.shape}, background={background.shape}, mask={mask.shape}"
             )
+        multiscale_levels, background_multiscale_mae = _build_multiscale_levels(
+            original_image,
+            original,
+            background_image,
+            mask,
+            self.config,
+        )
         assets = _RewardAssets(
             original=original,
             background_image=background_image,
@@ -254,6 +465,8 @@ class PixelMAEReward:
             layout_target=layout_target,
             layout_target_dilated=layout_target_dilated,
             background_masked_mae=masked_rgb_mae(background, original, mask),
+            multiscale_levels=multiscale_levels,
+            background_multiscale_mae=background_multiscale_mae,
         )
         self._asset_cache[key] = assets
         self._asset_cache.move_to_end(key)
@@ -284,6 +497,7 @@ class PixelMAEReward:
                 outside_mae=None,
                 background_masked_mae=assets.background_masked_mae,
                 restoration_delta=None,
+                background_multiscale_mae=assets.background_multiscale_mae,
                 **self._word_breakdown_kwargs(
                     unavailable_words, prediction_available=False
                 ),
@@ -323,6 +537,7 @@ class PixelMAEReward:
                 outside_mae=None,
                 background_masked_mae=assets.background_masked_mae,
                 restoration_delta=None,
+                background_multiscale_mae=assets.background_multiscale_mae,
                 **self._word_breakdown_kwargs(
                     word_metrics, prediction_available=prediction_available
                 ),
@@ -343,6 +558,7 @@ class PixelMAEReward:
                 outside_mae=None,
                 background_masked_mae=assets.background_masked_mae,
                 restoration_delta=None,
+                background_multiscale_mae=assets.background_multiscale_mae,
                 **self._word_breakdown_kwargs(
                     word_metrics, prediction_available=prediction_available
                 ),
@@ -353,14 +569,59 @@ class PixelMAEReward:
                 ),
             )
 
-        candidate = np.asarray(outcome.image.convert("RGB"), dtype=np.float32) / 255.0
+        candidate_image = outcome.image.convert("RGB")
+        candidate = np.asarray(candidate_image, dtype=np.float32) / 255.0
         masked_mae = masked_rgb_mae(candidate, assets.original, assets.mask)
         outside_mae = masked_rgb_mae(candidate, assets.background, 1.0 - assets.mask)
-        reward = 1.0 - masked_mae - self.config.outside_weight * outside_mae
-        if word_metrics.score is not None:
-            reward += self.config.word_reward_weight * word_metrics.score
-        if layout_metrics is not None:
-            reward += self.config.layout_reward_weight * layout_metrics.dilated_iou
+        multiscale_mae = _score_multiscale_mae(
+            candidate_image,
+            assets.multiscale_levels,
+            candidate_array=candidate,
+        )
+        coarse_visual_score = float(np.clip(1.0 - multiscale_mae, 0.0, 1.0))
+        fine_visual_score = float(np.clip(1.0 - masked_mae, 0.0, 1.0))
+
+        # Missing optional supervision is neutral for the gate, while its
+        # corresponding weighted component remains absent. GRPO datasets
+        # normally require OCR words and successful renders always have
+        # layout metrics, but neutral fallbacks preserve pixel-only use cases.
+        word_gate = (
+            float(np.clip(word_metrics.score, 0.0, 1.0))
+            if word_metrics.score is not None
+            else 1.0
+        )
+        layout_gate = (
+            math.sqrt(float(np.clip(layout_metrics.dilated_iou, 0.0, 1.0)))
+            if layout_metrics is not None
+            else 1.0
+        )
+        fine_visual_gate = word_gate * layout_gate
+        word_component = (
+            self.config.word_reward_weight * word_metrics.score
+            if word_metrics.score is not None
+            else 0.0
+        )
+        layout_component = (
+            self.config.layout_reward_weight * layout_metrics.dilated_iou
+            if layout_metrics is not None
+            else 0.0
+        )
+        coarse_visual_component = (
+            self.config.coarse_visual_reward_weight * coarse_visual_score
+        )
+        fine_visual_component = (
+            self.config.fine_visual_reward_weight
+            * fine_visual_score
+            * fine_visual_gate
+        )
+        outside_penalty = self.config.outside_weight * outside_mae
+        reward = (
+            word_component
+            + layout_component
+            + coarse_visual_component
+            + fine_visual_component
+            - outside_penalty
+        )
         return RewardBreakdown(
             sample_id=sample_id,
             status=RenderStatus.OK,
@@ -369,6 +630,19 @@ class PixelMAEReward:
             outside_mae=outside_mae,
             background_masked_mae=assets.background_masked_mae,
             restoration_delta=assets.background_masked_mae - masked_mae,
+            multiscale_mae=multiscale_mae,
+            background_multiscale_mae=assets.background_multiscale_mae,
+            multiscale_restoration_delta=(
+                assets.background_multiscale_mae - multiscale_mae
+            ),
+            coarse_visual_score=coarse_visual_score,
+            fine_visual_score=fine_visual_score,
+            fine_visual_gate=fine_visual_gate,
+            word_reward_component=float(word_component),
+            layout_reward_component=float(layout_component),
+            coarse_visual_reward_component=float(coarse_visual_component),
+            fine_visual_reward_component=float(fine_visual_component),
+            outside_penalty_component=float(outside_penalty),
             **self._word_breakdown_kwargs(
                 word_metrics, prediction_available=prediction_available
             ),

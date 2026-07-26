@@ -212,6 +212,39 @@ def train_grpo(
                         item.restoration_delta
                         if item.restoration_delta is not None
                         else float("nan"),
+                        item.background_multiscale_mae
+                        if item.background_multiscale_mae is not None
+                        else float("nan"),
+                        item.multiscale_mae
+                        if item.multiscale_mae is not None
+                        else float("nan"),
+                        item.multiscale_restoration_delta
+                        if item.multiscale_restoration_delta is not None
+                        else float("nan"),
+                        item.coarse_visual_score
+                        if item.coarse_visual_score is not None
+                        else float("nan"),
+                        item.fine_visual_score
+                        if item.fine_visual_score is not None
+                        else float("nan"),
+                        item.fine_visual_gate
+                        if item.fine_visual_gate is not None
+                        else float("nan"),
+                        item.word_reward_component
+                        if item.word_reward_component is not None
+                        else float("nan"),
+                        item.layout_reward_component
+                        if item.layout_reward_component is not None
+                        else float("nan"),
+                        item.coarse_visual_reward_component
+                        if item.coarse_visual_reward_component is not None
+                        else float("nan"),
+                        item.fine_visual_reward_component
+                        if item.fine_visual_reward_component is not None
+                        else float("nan"),
+                        item.outside_penalty_component
+                        if item.outside_penalty_component is not None
+                        else float("nan"),
                         item.word_precision
                         if item.word_precision is not None
                         else float("nan"),
@@ -256,6 +289,17 @@ def train_grpo(
                 "reconstruction/masked_mae",
                 "reconstruction/outside_mae",
                 "reconstruction/restoration_delta",
+                "reconstruction/background_multiscale_mae",
+                "reconstruction/multiscale_mae",
+                "reconstruction/multiscale_restoration_delta",
+                "reconstruction/coarse_visual_score",
+                "reconstruction/fine_visual_score",
+                "reward_components/fine_visual_gate",
+                "reward_components/word",
+                "reward_components/layout",
+                "reward_components/coarse_visual",
+                "reward_components/fine_visual",
+                "reward_components/outside_penalty",
                 "content/word_precision",
                 "content/word_recall",
                 "content/word_score",

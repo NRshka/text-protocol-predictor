@@ -87,6 +87,21 @@ def main(cfg: DictConfig) -> None:
                 cfg.reward.layout_dilation_iterations
             ),
             layout_bezier_samples=int(cfg.reward.layout_bezier_samples),
+            coarse_visual_reward_weight=float(
+                cfg.reward.coarse_visual_reward_weight
+            ),
+            fine_visual_reward_weight=float(
+                cfg.reward.fine_visual_reward_weight
+            ),
+            multiscale_downsample_factors=tuple(
+                int(value) for value in cfg.reward.multiscale_downsample_factors
+            ),
+            multiscale_blur_radii=tuple(
+                float(value) for value in cfg.reward.multiscale_blur_radii
+            ),
+            multiscale_weights=tuple(
+                float(value) for value in cfg.reward.multiscale_weights
+            ),
         ),
     )
     train_dataset = build_hf_grpo_dataset(
