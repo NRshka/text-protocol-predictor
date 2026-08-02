@@ -6,6 +6,7 @@ import pytest
 from PIL import Image
 
 from text_render_protocol_predictor.data import ProtocolManifestDataset
+from text_render_protocol_predictor.protocol import CoordinateTokenCodec
 
 
 def test_dataset_resolves_root_relative_paths(tmp_path, protocol_dict: dict) -> None:
@@ -50,6 +51,41 @@ def test_dataset_rejects_path_escape(tmp_path) -> None:
     dataset = ProtocolManifestDataset(dataset_root=tmp_path, manifest_path="train.jsonl")
     with pytest.raises(ValueError, match="escapes"):
         _ = dataset[0]
+
+
+def test_dataset_emits_quantized_model_target(tmp_path, protocol_dict: dict) -> None:
+    (tmp_path / "images").mkdir()
+    (tmp_path / "protocols").mkdir()
+    Image.new("RGB", (1280, 720)).save(tmp_path / "images" / "sample.jpg")
+    (tmp_path / "protocols" / "sample.json").write_text(
+        json.dumps(protocol_dict), encoding="utf-8"
+    )
+    (tmp_path / "train.jsonl").write_text(
+        json.dumps(
+            {
+                "sample_id": "sample-1",
+                "image": "images/sample.jpg",
+                "protocol": "protocols/sample.json",
+                "seed": 17,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    record = ProtocolManifestDataset(
+        dataset_root=tmp_path,
+        manifest_path="train.jsonl",
+        coordinate_codec=CoordinateTokenCodec(),
+    )[0]
+
+    target = json.loads(record.canonical_protocol)
+    assert target["objects"][0]["geometry"]["box"] == {
+        "x": "<coord_004>",
+        "y": "<coord_007>",
+        "width": "<coord_080>",
+        "height": "<coord_028>",
+    }
 
 
 def test_version_21_manifest_paths_are_relative_to_manifest_and_seed_is_optional(

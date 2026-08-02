@@ -15,6 +15,7 @@ from .structural_noise import (
     apply_structural_noise,
 )
 from ..protocol.canonicalizer import canonicalize
+from ..protocol.coordinate_tokens import CoordinateTokenCodec
 from ..protocol.schema import DatasetProtocol
 from ..protocol.validator import validate_dataset_protocol
 
@@ -47,6 +48,7 @@ class ProtocolManifestDataset:
         verify_image_dimensions: bool = True,
         max_objects: int | None = None,
         structural_noise: StructuralNoiseConfig | None = None,
+        coordinate_codec: CoordinateTokenCodec | None = None,
     ) -> None:
         self.dataset_root = Path(dataset_root).expanduser().resolve()
         manifest = Path(manifest_path)
@@ -61,6 +63,7 @@ class ProtocolManifestDataset:
         self.verify_image_dimensions = verify_image_dimensions
         self.max_objects = max_objects
         self.structural_noise = structural_noise or StructuralNoiseConfig()
+        self.coordinate_codec = coordinate_codec
 
     def __len__(self) -> int:
         return len(self.entries)
@@ -101,6 +104,14 @@ class ProtocolManifestDataset:
             seed=self.structural_noise.seed + protocol.seed,
             object_groups=entry.structural_groups,
         )
+        if self.coordinate_codec is None:
+            canonical_protocol = canonicalize(
+                protocol, decimal_places=self.decimal_places
+            )
+        else:
+            canonical_protocol = self.coordinate_codec.encode_json(
+                protocol, decimal_places=self.decimal_places
+            )
         return ProtocolDatasetRecord(
             sample_id=entry.sample_id,
             image_path=image_path,
@@ -110,7 +121,7 @@ class ProtocolManifestDataset:
             protocol_version=protocol.protocol_version,
             purpose=getattr(protocol, "purpose", "render"),
             protocol=protocol,
-            canonical_protocol=canonicalize(protocol, decimal_places=self.decimal_places),
+            canonical_protocol=canonical_protocol,
             seed=protocol.seed,
         )
 

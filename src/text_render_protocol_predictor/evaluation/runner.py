@@ -7,6 +7,10 @@ from typing import Any
 import torch
 
 from .generation import GenerationValidityMetrics, evaluate_generation_predictions
+from ..protocol.coordinate_tokens import (
+    CoordinateTokenCodec,
+    decode_coordinate_json_or_original,
+)
 
 
 @torch.no_grad()
@@ -18,6 +22,8 @@ def evaluate_generation(
     dataloader: Any,
     max_new_tokens: int,
     progress_bar: bool = True,
+    coordinate_codec: CoordinateTokenCodec | None = None,
+    decimal_places: int = 3,
 ) -> GenerationValidityMetrics:
     from accelerate.utils import gather_object
     from tqdm.auto import tqdm
@@ -59,6 +65,16 @@ def evaluate_generation(
         unique_results.setdefault(sample_id, (output, target))
     if was_training:
         model.train()
-    outputs = [result[0] for result in unique_results.values()]
-    targets = [result[1] for result in unique_results.values()]
+    outputs = [
+        decode_coordinate_json_or_original(
+            result[0], coordinate_codec, decimal_places=decimal_places
+        )
+        for result in unique_results.values()
+    ]
+    targets = [
+        decode_coordinate_json_or_original(
+            result[1], coordinate_codec, decimal_places=decimal_places
+        )
+        for result in unique_results.values()
+    ]
     return evaluate_generation_predictions(outputs, targets)

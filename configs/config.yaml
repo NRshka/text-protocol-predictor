@@ -41,6 +41,10 @@ protocol:
   decimal_places: 3
   unicode_normalization: NFC
   max_objects: 64
+  coordinate_encoding:
+    enabled: true
+    bins: 512
+    token_prefix: coord
 
 model:
   name_or_path: Qwen/Qwen3-VL-8B-Instruct

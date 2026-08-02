@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .prompts import ProtocolPromptTemplate
+from .tracking import HydraConfigCallback
 
 
 def _append_rendered_images_to_rows(
@@ -342,6 +343,7 @@ def train_grpo(
         if cfg.tracking.run_name:
             os.environ.setdefault("CLEARML_TASK", str(cfg.tracking.run_name))
     arguments = build_grpo_config(cfg)
+    resolved_config = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
     trainer = ProtocolGRPOTrainer(
         model=model,
         reward_funcs=reward,
@@ -349,6 +351,11 @@ def train_grpo(
         train_dataset=train_dataset,
         eval_dataset=validation_dataset,
         processing_class=processor,
+        callbacks=(
+            [HydraConfigCallback(tracking_provider, resolved_config)]
+            if tracking_provider != "none"
+            else None
+        ),
     )
 
     # TRL 0.29 clones an already-loaded PEFT adapter to a frozen `ref`
@@ -368,7 +375,7 @@ def train_grpo(
     if trainer.is_world_process_zero():
         processor.save_pretrained(final_dir)
         metadata = {
-            "resolved_config": OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True),
+            "resolved_config": resolved_config,
             "reward_config": asdict(reward.config),
             "renderer": renderer_metadata,
         }
