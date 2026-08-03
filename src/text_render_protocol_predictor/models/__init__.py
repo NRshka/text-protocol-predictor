@@ -4,6 +4,7 @@ from .qwen3_vl import (
     coordinate_trainable_token_indices,
     load_qwen3_vl_for_sft,
     resize_and_initialize_coordinate_embeddings,
+    resize_model_to_tokenizer_vocabulary,
 )
 
 __all__ = [
@@ -12,4 +13,5 @@ __all__ = [
     "coordinate_trainable_token_indices",
     "load_qwen3_vl_for_sft",
     "resize_and_initialize_coordinate_embeddings",
+    "resize_model_to_tokenizer_vocabulary",
 ]

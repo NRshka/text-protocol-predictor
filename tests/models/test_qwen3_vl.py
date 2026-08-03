@@ -11,6 +11,7 @@ from text_render_protocol_predictor.models.qwen3_vl import (
     coordinate_trainable_token_indices,
     inspect_peft_weights_directory,
     resize_and_initialize_coordinate_embeddings,
+    resize_model_to_tokenizer_vocabulary,
 )
 from text_render_protocol_predictor.protocol import CoordinateTokenCodec
 
@@ -179,3 +180,16 @@ def test_new_tokens_initialize_inside_preallocated_model_vocabulary() -> None:
 
     assert torch.equal(model.embed_tokens.weight[4], torch.tensor([1.0, 2.0]))
     assert torch.equal(model.lm_head.weight[4], torch.tensor([11.0, 12.0]))
+
+
+def test_expanded_checkpoint_tokenizer_resizes_base_before_peft_loading() -> None:
+    tokenizer = _FakeTokenizer()
+    tokenizer._size = 8
+    model = _FakeModel()
+
+    resized = resize_model_to_tokenizer_vocabulary(model, tokenizer)
+
+    assert resized is True
+    assert model.embed_tokens.weight.shape[0] == 8
+    assert model.lm_head.weight.shape[0] == 8
+    assert resize_model_to_tokenizer_vocabulary(model, tokenizer) is False

@@ -5,12 +5,14 @@ from dataclasses import dataclass
 import pytest
 from PIL import Image
 
+from text_render_protocol_predictor.training import ProtocolPromptTemplate
 from text_render_protocol_predictor.training.grpo_trainer import (
     _append_finite_metric,
     _append_rendered_images_to_rows,
     build_hf_grpo_dataset,
     grpo_conversation,
 )
+from text_render_protocol_predictor.protocol import CoordinateTokenCodec
 
 
 @dataclass
@@ -45,6 +47,21 @@ def test_grpo_conversation_leaves_image_in_separate_dataset_column():
     assert "Use protocol version 2.1" in messages[1]["content"]
     assert "Do not include shape objects" in messages[1]["content"]
     assert isinstance(messages[1]["content"], str)
+
+
+def test_grpo_conversation_requests_atomic_coordinates():
+    messages = grpo_conversation(
+        width=900,
+        height=1200,
+        protocol_version="2.1",
+        prompt_template=ProtocolPromptTemplate(
+            coordinate_codec=CoordinateTokenCodec()
+        ),
+    )
+
+    text = messages[1]["content"]
+    assert '"<coord_000>" through "<coord_511>"' in text
+    assert "Normalize horizontal values by canvas width" in text
 
 
 def test_hf_dataset_exposes_original_to_policy_and_reward_paths(tmp_path):

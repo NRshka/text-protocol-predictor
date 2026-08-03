@@ -20,6 +20,10 @@ protocol:
   # decorations already remain in erased backgrounds.
   version: "2.1"
   max_objects: 64
+  coordinate_encoding:
+    enabled: true
+    bins: 512
+    token_prefix: coord
 
 renderer:
   # Files or directories scanned by synthetic-text-protocol's FontRegistry.

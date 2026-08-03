@@ -154,6 +154,16 @@ def resize_and_initialize_coordinate_embeddings(
                 )
 
 
+def resize_model_to_tokenizer_vocabulary(model: Any, tokenizer: Any) -> bool:
+    """Ensure PEFT can address every token row stored by a checkpoint tokenizer."""
+    model_vocab_size = int(model.get_input_embeddings().weight.shape[0])
+    target_vocab_size = max(len(tokenizer), model_vocab_size)
+    if target_vocab_size == model_vocab_size:
+        return False
+    model.resize_token_embeddings(target_vocab_size, mean_resizing=False)
+    return True
+
+
 def coordinate_trainable_token_indices(
     model: Any, registration: CoordinateTokenRegistration
 ) -> list[int] | dict[str, list[int]]:
@@ -290,6 +300,12 @@ def load_qwen3_vl_for_sft(
         trainable_token_indices = coordinate_trainable_token_indices(
             model, coordinate_registration
         )
+    else:
+        # A PEFT export may carry an expanded tokenizer even when the caller
+        # does not use the corresponding codec directly. PEFT installs its
+        # TrainableTokens wrappers before loading adapter state, so the base
+        # vocabulary must already contain every referenced row.
+        resize_model_to_tokenizer_vocabulary(model, processor.tokenizer)
     if bool(model_cfg.gradient_checkpointing):
         model.gradient_checkpointing_enable()
         model.config.use_cache = False

@@ -8,6 +8,7 @@ import pytest
 from PIL import Image
 
 from text_render_protocol_predictor.rendering import RenderOutcome, RenderStatus
+from text_render_protocol_predictor.protocol import CoordinateTokenCodec
 from text_render_protocol_predictor.rewards import (
     PixelMAEReward,
     PixelMAERewardConfig,
@@ -118,6 +119,32 @@ def test_invalid_completion_gets_floor_and_duplicates_render_once(tmp_path):
         0.35,
     ]
     assert renderer.calls == 2
+
+
+def test_reward_decodes_atomic_coordinates_before_rendering(
+    tmp_path, protocol_dict: dict
+):
+    original, _, paths = _assets(tmp_path)
+    codec = CoordinateTokenCodec()
+    encoded = codec.encode_json(protocol_dict)
+    decoded = codec.decode_json(encoded)
+    renderer = FakeRenderer({decoded: original})
+    reward = PixelMAEReward(
+        renderer,
+        PixelMAERewardConfig(mask_dilation_radius=0, mask_blur_radius=0),
+        coordinate_codec=codec,
+    )
+
+    result = reward.score(
+        encoded,
+        sample_id="sample",
+        original_path=paths[0],
+        background_path=paths[1],
+        text_mask_path=paths[2],
+    )
+
+    assert result.status is RenderStatus.OK
+    assert renderer.calls == 1
 
 
 def test_word_reward_prefers_correct_content_and_rejects_empty_protocol(tmp_path):

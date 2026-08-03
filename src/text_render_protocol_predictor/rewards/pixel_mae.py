@@ -13,6 +13,10 @@ import numpy as np
 from PIL import Image, ImageFilter
 
 from ..rendering import RenderStatus
+from ..protocol.coordinate_tokens import (
+    CoordinateTokenCodec,
+    decode_coordinate_json_or_original,
+)
 from .layout_iou import (
     LayoutMaskMetrics,
     calculate_layout_mask_metrics,
@@ -385,7 +389,13 @@ def _extract_prediction_texts(completion: str) -> tuple[str, ...]:
 class PixelMAEReward:
     """TRL-compatible callable that renders completions and scores reconstruction."""
 
-    def __init__(self, renderer: Any, config: PixelMAERewardConfig | None = None) -> None:
+    def __init__(
+        self,
+        renderer: Any,
+        config: PixelMAERewardConfig | None = None,
+        *,
+        coordinate_codec: CoordinateTokenCodec | None = None,
+    ) -> None:
         self.config = config or PixelMAERewardConfig()
         # TRL names Python reward callables through ``__name__`` for metrics.
         component_count = sum(
@@ -401,6 +411,7 @@ class PixelMAEReward:
             "reconstruction_composite" if component_count > 1 else "pixel_mae"
         )
         self.renderer = renderer
+        self.coordinate_codec = coordinate_codec
         self._asset_cache: OrderedDict[tuple[str, str, str], _RewardAssets] = OrderedDict()
         self.last_breakdowns: list[RewardBreakdown] = []
         self._failure_rewards = {
@@ -505,8 +516,12 @@ class PixelMAEReward:
                 error=str(exc),
             )
 
-        outcome = self.renderer.render_prediction(
+        renderer_completion = decode_coordinate_json_or_original(
             completion_text,
+            self.coordinate_codec,
+        )
+        outcome = self.renderer.render_prediction(
+            renderer_completion,
             assets.background_image.copy(),
             sample_id=sample_id,
         )
@@ -515,7 +530,7 @@ class PixelMAEReward:
         )
         predicted_texts = outcome.predicted_texts
         if predicted_texts is None:
-            predicted_texts = _extract_prediction_texts(completion_text)
+            predicted_texts = _extract_prediction_texts(renderer_completion)
         word_metrics = self._match_words(predicted_texts, reference_words)
         # INVALID_SEMANTICS can be returned before geometry safety validation
         # (for example on a wrong canvas), so never rasterize that prediction.

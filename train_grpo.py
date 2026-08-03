@@ -7,9 +7,13 @@ from omegaconf import DictConfig
 
 from src.text_render_protocol_predictor.data import GRPOManifestDataset, validate_dataset
 from src.text_render_protocol_predictor.models import load_qwen3_vl_for_sft
+from src.text_render_protocol_predictor.protocol import coordinate_codec_from_config
 from src.text_render_protocol_predictor.rendering import SyntextPredictionRenderer
 from src.text_render_protocol_predictor.rewards import PixelMAEReward, PixelMAERewardConfig
-from src.text_render_protocol_predictor.training import build_hf_grpo_dataset
+from src.text_render_protocol_predictor.training import (
+    ProtocolPromptTemplate,
+    build_hf_grpo_dataset,
+)
 from src.text_render_protocol_predictor.training.grpo_trainer import train_grpo
 
 
@@ -27,6 +31,7 @@ def main(cfg: DictConfig) -> None:
             "the erased-text milestone supports protocol 1.0 or text-only protocol 2.1"
         )
 
+    coordinate_codec = coordinate_codec_from_config(cfg.protocol)
     dataset_kwargs = {
         "dataset_root": cfg.dataset.root_dir,
         "mask_threshold": float(cfg.reward.mask_threshold),
@@ -103,22 +108,30 @@ def main(cfg: DictConfig) -> None:
                 float(value) for value in cfg.reward.multiscale_weights
             ),
         ),
+        coordinate_codec=coordinate_codec,
     )
+    prompt_template = ProtocolPromptTemplate(coordinate_codec=coordinate_codec)
     train_dataset = build_hf_grpo_dataset(
         train_source,
         protocol_version=str(cfg.protocol.version),
+        prompt_template=prompt_template,
     )
     validation_dataset = (
         build_hf_grpo_dataset(
             validation_source,
             protocol_version=str(cfg.protocol.version),
+            prompt_template=prompt_template,
         )
         if validation_source is not None
         else None
     )
 
     # Allocate the large model only after dataset and renderer preflight pass.
-    model, processor = load_qwen3_vl_for_sft(cfg.model, cfg.lora)
+    model, processor = load_qwen3_vl_for_sft(
+        cfg.model,
+        cfg.lora,
+        coordinate_codec=coordinate_codec,
+    )
     train_grpo(
         cfg=cfg,
         model=model,
