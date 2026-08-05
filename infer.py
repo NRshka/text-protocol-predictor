@@ -11,7 +11,11 @@ from PIL import Image
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
 from src.text_render_protocol_predictor.evaluation import evaluate_generation_validity
-from src.text_render_protocol_predictor.models.qwen3_vl import inspect_peft_weights_directory
+from src.text_render_protocol_predictor.models.qwen3_vl import (
+    inspect_peft_weights_directory,
+    resize_model_to_tokenizer_vocabulary,
+)
+from src.text_render_protocol_predictor.protocol import CoordinateTokenCodec
 from src.text_render_protocol_predictor.training import ProtocolPromptTemplate
 
 
@@ -28,7 +32,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--image-min-pixels", type=int, default=200704)
     parser.add_argument("--image-max-pixels", type=int, default=1003520)
-    parser.add_argument("--output", type=Path, help="Also save the raw generation here")
+    parser.add_argument("--output", type=Path, help="Save the pixel-coordinate prediction here")
+    parser.add_argument(
+        "--raw-output",
+        type=Path,
+        help="Optionally save the native model generation before coordinate decoding",
+    )
+    parser.add_argument(
+        "--coordinate-encoding",
+        choices=("auto", "enabled", "disabled"),
+        default="auto",
+        help="Detect atomic coordinate tokens in the checkpoint, require them, or disable them",
+    )
+    parser.add_argument("--coordinate-bins", type=int, default=512)
+    parser.add_argument("--coordinate-token-prefix", default="coord")
     parser.add_argument("--pretty", action="store_true", help="Pretty-print valid JSON")
     return parser.parse_args()
 
@@ -37,6 +54,63 @@ def resolve_dtype(name: str, device: str) -> torch.dtype:
     if name == "auto":
         return torch.bfloat16 if device.startswith("cuda") else torch.float32
     return {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[name]
+
+
+def resolve_coordinate_codec(
+    tokenizer: object,
+    *,
+    mode: str,
+    bins: int,
+    token_prefix: str,
+) -> CoordinateTokenCodec | None:
+    """Resolve coordinate encoding without introducing untrained inference tokens."""
+    if mode == "disabled":
+        return None
+    codec = CoordinateTokenCodec(bins=bins, prefix=token_prefix)
+    vocabulary = tokenizer.get_vocab()
+    present = sum(token in vocabulary for token in codec.tokenizer_tokens)
+    if present == codec.bins:
+        return codec
+    if present:
+        raise ValueError(
+            f"checkpoint tokenizer contains only {present}/{codec.bins} expected "
+            "coordinate tokens"
+        )
+    if mode == "enabled":
+        raise ValueError(
+            "coordinate encoding was explicitly enabled, but the checkpoint tokenizer "
+            "does not contain the configured coordinate tokens"
+        )
+    return None
+
+
+def decode_prediction_coordinates(
+    output: str,
+    codec: CoordinateTokenCodec | None,
+    *,
+    image_size: tuple[int, int],
+) -> tuple[str, str | None]:
+    """Decode atomic coordinates against the actual input image dimensions."""
+    if codec is None:
+        return output, None
+    try:
+        return codec.decode_json(output, canvas_size=image_size), None
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        return output, str(exc)
+
+
+def write_prediction(path: Path, output: str) -> None:
+    """Write pretty JSON when possible and preserve invalid text for diagnosis."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        value = json.loads(output)
+    except json.JSONDecodeError:
+        path.write_text(output + "\n", encoding="utf-8")
+        return
+    path.write_text(
+        json.dumps(value, ensure_ascii=False, indent=4) + "\n",
+        encoding="utf-8",
+    )
 
 
 def main() -> None:
@@ -57,11 +131,18 @@ def main() -> None:
         min_pixels=args.image_min_pixels,
         max_pixels=args.image_max_pixels,
     )
+    coordinate_codec = resolve_coordinate_codec(
+        processor.tokenizer,
+        mode=args.coordinate_encoding,
+        bins=args.coordinate_bins,
+        token_prefix=args.coordinate_token_prefix,
+    )
     model = Qwen3VLForConditionalGeneration.from_pretrained(
         base_model,
         dtype=resolve_dtype(args.dtype, args.device),
         attn_implementation="sdpa",
     )
+    resize_model_to_tokenizer_vocabulary(model, processor.tokenizer)
     if weights_path is not None:
         from peft import PeftModel
 
@@ -71,7 +152,7 @@ def main() -> None:
 
     with Image.open(args.image) as image:
         width, height = image.size
-    conversation = ProtocolPromptTemplate().conversation(
+    conversation = ProtocolPromptTemplate(coordinate_codec=coordinate_codec).conversation(
         image=args.image,
         width=width,
         height=height,
@@ -100,11 +181,16 @@ def main() -> None:
         torch.cuda.synchronize(args.device)
     generation_latency_seconds = time.perf_counter() - generation_started_at
     completion = generated[:, batch["input_ids"].shape[1] :]
-    output = processor.batch_decode(
+    raw_output = processor.batch_decode(
         completion,
         skip_special_tokens=True,
         clean_up_tokenization_spaces=False,
     )[0]
+    output, coordinate_decode_error = decode_prediction_coordinates(
+        raw_output,
+        coordinate_codec,
+        image_size=(width, height),
+    )
 
     metrics = evaluate_generation_validity([output])
     print(
@@ -114,11 +200,15 @@ def main() -> None:
         f"generation_latency_seconds={generation_latency_seconds:.3f}",
         file=sys.stderr,
     )
+    if coordinate_decode_error is not None:
+        print(
+            f"coordinate_decode_error={coordinate_decode_error}",
+            file=sys.stderr,
+        )
+    if args.raw_output:
+        write_prediction(args.raw_output, raw_output)
     if args.output:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        # args.output.write_text(output + "\n", encoding="utf-8")
-        with open(args.output, "w") as file:
-            json.dump(json.loads(output), file, ensure_ascii=False, indent=4)
+        write_prediction(args.output, output)
     if args.pretty and metrics.valid_json_count:
         print(json.dumps(json.loads(output), ensure_ascii=False, indent=4))
     else:

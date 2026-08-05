@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -98,9 +99,17 @@ class CoordinateTokenCodec:
         value: Mapping[str, Any] | str,
         *,
         decimal_places: int = DEFAULT_DECIMAL_PLACES,
+        canvas_size: tuple[int, int] | None = None,
     ) -> str:
         """Decode model-facing JSON back to a validated canonical protocol."""
-        target = json.loads(value) if isinstance(value, str) else dict(value)
+        target = json.loads(value) if isinstance(value, str) else deepcopy(dict(value))
+        if canvas_size is not None:
+            width, height = canvas_size
+            if width <= 0 or height <= 0:
+                raise ValueError("canvas_size dimensions must be positive")
+            if not isinstance(target.get("canvas"), Mapping):
+                raise ValueError("protocol canvas must be an object")
+            target["canvas"] = {"width": int(width), "height": int(height)}
         self._transform_protocol(target, encode=False)
         return canonicalize(target, decimal_places=decimal_places)
 

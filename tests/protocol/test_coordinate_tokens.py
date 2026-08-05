@@ -89,3 +89,15 @@ def test_decoder_rejects_non_coordinate_geometry_values(protocol_dict: dict) -> 
 
     with pytest.raises(ValueError, match="expected a coordinate token"):
         CoordinateTokenCodec().decode_json(encoded)
+
+
+def test_decoder_can_use_external_canvas_dimensions(protocol_dict: dict) -> None:
+    codec = CoordinateTokenCodec()
+    encoded = codec.encode_json(protocol_dict)
+
+    decoded = json.loads(codec.decode_json(encoded, canvas_size=(640, 360)))
+
+    assert decoded["canvas"] == {"width": 640, "height": 360}
+    assert decoded["objects"][0]["geometry"]["box"]["width"] == pytest.approx(
+        100.196, abs=0.001
+    )
