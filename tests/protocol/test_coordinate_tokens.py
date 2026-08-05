@@ -63,6 +63,17 @@ def test_coordinate_codec_quantizes_shape_boxes(protocol_21_dict: dict) -> None:
     assert shape["geometry"]["corner_radius"] == 12
 
 
+def test_coordinate_codec_filters_shapes_before_quantization(
+    protocol_21_dict: dict,
+) -> None:
+    encoded = json.loads(
+        CoordinateTokenCodec().encode_json(protocol_21_dict, text_only=True)
+    )
+
+    assert [obj["object_type"] for obj in encoded["objects"]] == ["text"]
+    assert all(obj["id"] != "panel" for obj in encoded["objects"])
+
+
 def test_positive_box_dimensions_never_encode_as_zero(protocol_dict: dict) -> None:
     protocol = copy.deepcopy(protocol_dict)
     protocol["objects"][0]["geometry"]["box"]["width"] = 0.01

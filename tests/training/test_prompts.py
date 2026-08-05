@@ -31,6 +31,20 @@ def test_text_only_prompt_keeps_version_21_but_rejects_shapes() -> None:
     assert "text and shape objects" not in text
 
 
+def test_template_level_text_only_setting_applies_to_conversations() -> None:
+    conversation = ProtocolPromptTemplate(text_only=True).conversation(
+        image="image.png",
+        width=100,
+        height=50,
+        protocol_version="2.1",
+    )
+    text = conversation[1]["content"][1]["text"]
+
+    assert "visible text objects" in text
+    assert "Do not include shape objects" in text
+    assert "text and shape objects" not in text
+
+
 def test_coordinate_prompt_describes_quantized_geometry_fields() -> None:
     text = ProtocolPromptTemplate(
         coordinate_codec=CoordinateTokenCodec(bins=512)

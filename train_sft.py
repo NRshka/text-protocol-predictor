@@ -24,13 +24,18 @@ def main(cfg: DictConfig) -> None:
             "it cannot be combined with training.resume_from"
         )
     coordinate_codec = coordinate_codec_from_config(cfg.protocol)
-    prompt_template = ProtocolPromptTemplate(coordinate_codec=coordinate_codec)
+    text_only = bool(cfg.protocol.text_only)
+    prompt_template = ProtocolPromptTemplate(
+        coordinate_codec=coordinate_codec,
+        text_only=text_only,
+    )
     common = {
         "dataset_root": cfg.dataset.root_dir,
         "decimal_places": int(cfg.protocol.decimal_places),
         "verify_image_dimensions": bool(cfg.dataset.verify_image_dimensions),
         "max_objects": int(cfg.protocol.max_objects),
         "coordinate_codec": coordinate_codec,
+        "text_only_targets": text_only,
     }
     train_dataset = ProtocolManifestDataset(
         manifest_path=cfg.dataset.manifests.train,

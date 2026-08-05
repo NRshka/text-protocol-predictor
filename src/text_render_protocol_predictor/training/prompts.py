@@ -14,6 +14,7 @@ class ProtocolPromptTemplate:
     version: str = "1.1.0"
     system: str = "You extract editable text rendering protocols from images."
     coordinate_codec: CoordinateTokenCodec | None = None
+    text_only: bool = False
 
     def user_text(
         self,
@@ -23,14 +24,15 @@ class ProtocolPromptTemplate:
         *,
         text_only: bool = False,
     ) -> str:
+        effective_text_only = self.text_only or text_only
         object_description = (
             "text objects"
-            if text_only or protocol_version == "1.0"
+            if effective_text_only or protocol_version == "1.0"
             else "text and shape objects"
         )
         shape_instruction = (
             'Do not include shape objects; every object must have object_type "text".\n'
-            if text_only and protocol_version != "1.0"
+            if effective_text_only and protocol_version != "1.0"
             else ""
         )
         if self.coordinate_codec is None:

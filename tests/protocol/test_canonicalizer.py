@@ -32,3 +32,10 @@ def test_version_21_projection_keeps_shapes_and_removes_evidence(
     assert all("annotation" not in obj for obj in target["objects"])
     assert all("tight_bbox" not in obj for obj in target["objects"])
     assert canonicalize(json.dumps(target)) == canonicalize(protocol_21_dict)
+
+
+def test_text_only_projection_removes_shapes(protocol_21_dict: dict) -> None:
+    target = json.loads(canonicalize(protocol_21_dict, text_only=True))
+
+    assert [obj["object_type"] for obj in target["objects"]] == ["text"]
+    assert [obj["id"] for obj in target["objects"]] == ["source-b"]

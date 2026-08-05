@@ -30,6 +30,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--protocol-version", choices=("1.0", "2.0", "2.1"), default="1.0"
     )
+    parser.add_argument(
+        "--text-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Request text objects only (use --no-text-only for legacy shape-aware models)",
+    )
     parser.add_argument("--image-min-pixels", type=int, default=200704)
     parser.add_argument("--image-max-pixels", type=int, default=1003520)
     parser.add_argument("--output", type=Path, help="Save the pixel-coordinate prediction here")
@@ -159,7 +165,10 @@ def main() -> None:
 
     with Image.open(args.image) as image:
         width, height = image.size
-    conversation = ProtocolPromptTemplate(coordinate_codec=coordinate_codec).conversation(
+    conversation = ProtocolPromptTemplate(
+        coordinate_codec=coordinate_codec,
+        text_only=args.text_only,
+    ).conversation(
         image=args.image,
         width=width,
         height=height,

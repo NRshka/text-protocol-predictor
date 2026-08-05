@@ -19,6 +19,8 @@ protocol:
   # Keep the policy aligned with 2.1 SFT while requesting text objects only:
   # decorations already remain in erased backgrounds.
   version: "2.1"
+  # GRPO prompts request text only and the renderer rejects shape completions.
+  text_only: true
   max_objects: 64
   coordinate_encoding:
     enabled: true

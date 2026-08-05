@@ -121,3 +121,15 @@ def test_version_21_manifest_paths_are_relative_to_manifest_and_seed_is_optional
     assert record.purpose == "annotation"
     assert record.seed == 0
     assert record.image_path == tmp_path / "images" / "sample.jpg"
+
+    text_only_record = ProtocolManifestDataset(
+        dataset_root=tmp_path,
+        manifest_path="splits/validation.jsonl",
+        font_ids={"Inter"},
+        coordinate_codec=CoordinateTokenCodec(),
+        text_only_targets=True,
+        max_objects=1,
+    )[0]
+    target = json.loads(text_only_record.canonical_protocol)
+    assert [obj["object_type"] for obj in target["objects"]] == ["text"]
+    assert [obj["id"] for obj in target["objects"]] == ["source-b"]

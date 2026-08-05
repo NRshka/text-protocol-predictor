@@ -110,7 +110,10 @@ def main(cfg: DictConfig) -> None:
         ),
         coordinate_codec=coordinate_codec,
     )
-    prompt_template = ProtocolPromptTemplate(coordinate_codec=coordinate_codec)
+    prompt_template = ProtocolPromptTemplate(
+        coordinate_codec=coordinate_codec,
+        text_only=bool(cfg.protocol.text_only),
+    )
     train_dataset = build_hf_grpo_dataset(
         train_source,
         protocol_version=str(cfg.protocol.version),

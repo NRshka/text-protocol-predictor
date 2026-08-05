@@ -83,9 +83,16 @@ class CoordinateTokenCodec:
         value: Mapping[str, Any] | Any | str,
         *,
         decimal_places: int = DEFAULT_DECIMAL_PLACES,
+        text_only: bool = False,
     ) -> str:
         """Return canonical prediction JSON with quantized geometry values."""
-        target = json.loads(canonicalize(value, decimal_places=decimal_places))
+        target = json.loads(
+            canonicalize(
+                value,
+                decimal_places=decimal_places,
+                text_only=text_only,
+            )
+        )
         self._transform_protocol(target, encode=True)
         return json.dumps(
             target,

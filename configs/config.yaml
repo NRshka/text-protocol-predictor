@@ -37,6 +37,8 @@ augmentation:
 
 protocol:
   version: "1.0"
+  # Decorative shapes remain visible in the image but are excluded from model targets.
+  text_only: true
   canonicalizer_version: "1.0.0"
   decimal_places: 3
   unicode_normalization: NFC
