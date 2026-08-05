@@ -81,6 +81,28 @@ def test_inference_decodes_using_actual_image_resolution(protocol_dict: dict) ->
     assert "<coord_" not in decoded
 
 
+def test_inference_decodes_tokens_while_preserving_numeric_coordinates(
+    protocol_dict: dict,
+) -> None:
+    codec = CoordinateTokenCodec()
+    encoded = json.loads(codec.encode_json(protocol_dict))
+    encoded["objects"][0]["geometry"]["box"]["width"] = 1
+
+    decoded, error = decode_prediction_coordinates(
+        json.dumps(encoded),
+        codec,
+        image_size=(1280, 720),
+    )
+    prediction = json.loads(decoded)
+
+    assert error is None
+    assert prediction["objects"][0]["geometry"]["box"]["width"] == 1
+    assert prediction["objects"][0]["geometry"]["box"]["x"] == pytest.approx(
+        10.02, abs=0.001
+    )
+    assert "<coord_" not in decoded
+
+
 def test_inference_preserves_invalid_generation_and_reports_decode_error() -> None:
     output, error = decode_prediction_coordinates(
         "not json",

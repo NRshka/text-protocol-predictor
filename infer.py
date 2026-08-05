@@ -94,7 +94,14 @@ def decode_prediction_coordinates(
     if codec is None:
         return output, None
     try:
-        return codec.decode_json(output, canvas_size=image_size), None
+        return (
+            codec.decode_json(
+                output,
+                canvas_size=image_size,
+                allow_numeric_coordinates=True,
+            ),
+            None,
+        )
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
         return output, str(exc)
 

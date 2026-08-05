@@ -100,6 +100,7 @@ class CoordinateTokenCodec:
         *,
         decimal_places: int = DEFAULT_DECIMAL_PLACES,
         canvas_size: tuple[int, int] | None = None,
+        allow_numeric_coordinates: bool = False,
     ) -> str:
         """Decode model-facing JSON back to a validated canonical protocol."""
         target = json.loads(value) if isinstance(value, str) else deepcopy(dict(value))
@@ -110,7 +111,11 @@ class CoordinateTokenCodec:
             if not isinstance(target.get("canvas"), Mapping):
                 raise ValueError("protocol canvas must be an object")
             target["canvas"] = {"width": int(width), "height": int(height)}
-        self._transform_protocol(target, encode=False)
+        self._transform_protocol(
+            target,
+            encode=False,
+            allow_numeric_coordinates=allow_numeric_coordinates,
+        )
         return canonicalize(target, decimal_places=decimal_places)
 
     def _parse_token(self, value: Any) -> int:
@@ -126,7 +131,13 @@ class CoordinateTokenCodec:
             raise ValueError(f"coordinate token index {index} is outside [0, {self.bins - 1}]")
         return index
 
-    def _transform_protocol(self, protocol: dict[str, Any], *, encode: bool) -> None:
+    def _transform_protocol(
+        self,
+        protocol: dict[str, Any],
+        *,
+        encode: bool,
+        allow_numeric_coordinates: bool = False,
+    ) -> None:
         canvas = protocol.get("canvas")
         if not isinstance(canvas, Mapping):
             raise ValueError("protocol canvas must be an object")
@@ -149,10 +160,36 @@ class CoordinateTokenCodec:
             box = geometry.get("box")
             if not isinstance(box, dict):
                 raise ValueError("protocol geometry box must be an object")
-            self._transform_pair(box, "x", width, encode=encode)
-            self._transform_pair(box, "y", height, encode=encode)
-            self._transform_pair(box, "width", width, encode=encode, positive=True)
-            self._transform_pair(box, "height", height, encode=encode, positive=True)
+            self._transform_pair(
+                box,
+                "x",
+                width,
+                encode=encode,
+                allow_numeric_coordinates=allow_numeric_coordinates,
+            )
+            self._transform_pair(
+                box,
+                "y",
+                height,
+                encode=encode,
+                allow_numeric_coordinates=allow_numeric_coordinates,
+            )
+            self._transform_pair(
+                box,
+                "width",
+                width,
+                encode=encode,
+                positive=True,
+                allow_numeric_coordinates=allow_numeric_coordinates,
+            )
+            self._transform_pair(
+                box,
+                "height",
+                height,
+                encode=encode,
+                positive=True,
+                allow_numeric_coordinates=allow_numeric_coordinates,
+            )
 
             baseline = geometry.get("baseline")
             if baseline is None:
@@ -163,8 +200,20 @@ class CoordinateTokenCodec:
                 point = baseline.get(point_name)
                 if not isinstance(point, dict):
                     raise ValueError(f"protocol baseline {point_name} must be an object")
-                self._transform_pair(point, "x", width, encode=encode)
-                self._transform_pair(point, "y", height, encode=encode)
+                self._transform_pair(
+                    point,
+                    "x",
+                    width,
+                    encode=encode,
+                    allow_numeric_coordinates=allow_numeric_coordinates,
+                )
+                self._transform_pair(
+                    point,
+                    "y",
+                    height,
+                    encode=encode,
+                    allow_numeric_coordinates=allow_numeric_coordinates,
+                )
 
     def _transform_pair(
         self,
@@ -174,6 +223,7 @@ class CoordinateTokenCodec:
         *,
         encode: bool,
         positive: bool = False,
+        allow_numeric_coordinates: bool = False,
     ) -> None:
         if key not in container:
             raise ValueError(f"missing geometry coordinate {key!r}")
@@ -181,7 +231,12 @@ class CoordinateTokenCodec:
             index = self.quantize(container[key], extent, positive=positive)
             container[key] = self.token(index)
         else:
-            index = self._parse_token(container[key])
+            value = container[key]
+            if allow_numeric_coordinates and isinstance(value, (int, float)) and not isinstance(
+                value, bool
+            ):
+                return
+            index = self._parse_token(value)
             container[key] = self.dequantize(index, extent)
 
 
