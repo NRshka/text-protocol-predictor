@@ -1,0 +1,777 @@
+"""Composite rendered-pixel, OCR-word, and coarse-layout reward."""
+
+from __future__ import annotations
+
+from collections import OrderedDict
+from dataclasses import dataclass
+import json
+import math
+from pathlib import Path
+from typing import Any, Sequence
+
+import numpy as np
+from PIL import Image, ImageFilter
+
+from ..rendering import RenderStatus
+from ..protocol.coordinate_tokens import (
+    CoordinateTokenCodec,
+    decode_coordinate_json_or_original,
+)
+from .layout_iou import (
+    LayoutMaskMetrics,
+    calculate_layout_mask_metrics,
+    dilate_layout_mask,
+    rasterize_protocol_layout_mask,
+    threshold_layout_mask,
+)
+from .word_content import WordMatchMetrics, match_word_content
+
+
+@dataclass(frozen=True)
+class PixelMAERewardConfig:
+    mask_threshold: float = 0.5
+    mask_dilation_radius: int = 4
+    mask_blur_radius: float = 2.0
+    outside_weight: float = 0.1
+    cache_size: int = 8
+    invalid_json_reward: float = -1.0
+    invalid_schema_reward: float = -0.9
+    invalid_semantics_reward: float = -0.85
+    unknown_font_reward: float = -0.8
+    renderer_failure_reward: float = -0.8
+    # Structured reward weights sum to one by default. Fine visual similarity
+    # is gated by word/layout quality; coarse similarity remains available for
+    # partially correct candidates.
+    word_reward_weight: float = 0.35
+    word_recall_weight: float = 0.7
+    word_fuzzy_threshold: float = 0.8
+    minimum_ocr_confidence: float = 0.5
+    reject_empty_word_predictions: bool = True
+    layout_reward_weight: float = 0.30
+    layout_dilation_kernel_size: int = 5
+    layout_dilation_iterations: int = 3
+    layout_bezier_samples: int = 129
+    coarse_visual_reward_weight: float = 0.25
+    fine_visual_reward_weight: float = 0.10
+    multiscale_downsample_factors: tuple[int, ...] = (4, 2, 1)
+    multiscale_blur_radii: tuple[float, ...] = (5.0, 2.0, 0.0)
+    multiscale_weights: tuple[float, ...] = (0.5, 0.3, 0.2)
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.mask_threshold <= 1.0:
+            raise ValueError("mask_threshold must be between 0 and 1")
+        if self.mask_dilation_radius < 0:
+            raise ValueError("mask_dilation_radius must be non-negative")
+        if self.mask_blur_radius < 0:
+            raise ValueError("mask_blur_radius must be non-negative")
+        if self.outside_weight < 0:
+            raise ValueError("outside_weight must be non-negative")
+        if self.cache_size < 1:
+            raise ValueError("cache_size must be positive")
+        if self.word_reward_weight < 0:
+            raise ValueError("word_reward_weight must be non-negative")
+        if not 0.0 <= self.word_recall_weight <= 1.0:
+            raise ValueError("word_recall_weight must be between 0 and 1")
+        if not 0.0 <= self.word_fuzzy_threshold <= 1.0:
+            raise ValueError("word_fuzzy_threshold must be between 0 and 1")
+        if not 0.0 <= self.minimum_ocr_confidence <= 1.0:
+            raise ValueError("minimum_ocr_confidence must be between 0 and 1")
+        if self.layout_reward_weight < 0:
+            raise ValueError("layout_reward_weight must be non-negative")
+        if self.coarse_visual_reward_weight < 0:
+            raise ValueError("coarse_visual_reward_weight must be non-negative")
+        if self.fine_visual_reward_weight < 0:
+            raise ValueError("fine_visual_reward_weight must be non-negative")
+        component_weight = (
+            self.word_reward_weight
+            + self.layout_reward_weight
+            + self.coarse_visual_reward_weight
+            + self.fine_visual_reward_weight
+        )
+        if component_weight <= 0:
+            raise ValueError("at least one structured reward weight must be positive")
+        scale_lengths = {
+            len(self.multiscale_downsample_factors),
+            len(self.multiscale_blur_radii),
+            len(self.multiscale_weights),
+        }
+        if len(scale_lengths) != 1 or not self.multiscale_weights:
+            raise ValueError(
+                "multiscale factors, blur radii, and weights must be non-empty "
+                "sequences of equal length"
+            )
+        if any(factor < 1 for factor in self.multiscale_downsample_factors):
+            raise ValueError("multiscale downsample factors must be positive integers")
+        if any(radius < 0 for radius in self.multiscale_blur_radii):
+            raise ValueError("multiscale blur radii must be non-negative")
+        if any(weight < 0 for weight in self.multiscale_weights):
+            raise ValueError("multiscale weights must be non-negative")
+        if sum(self.multiscale_weights) <= 0:
+            raise ValueError("at least one multiscale weight must be positive")
+        if (
+            self.layout_dilation_kernel_size < 1
+            or self.layout_dilation_kernel_size % 2 == 0
+        ):
+            raise ValueError(
+                "layout_dilation_kernel_size must be a positive odd integer"
+            )
+        if self.layout_dilation_iterations < 0:
+            raise ValueError("layout_dilation_iterations must be non-negative")
+        if self.layout_bezier_samples < 2:
+            raise ValueError("layout_bezier_samples must be at least two")
+
+
+@dataclass(frozen=True)
+class RewardBreakdown:
+    sample_id: str
+    status: RenderStatus
+    reward: float
+    masked_mae: float | None
+    outside_mae: float | None
+    background_masked_mae: float
+    restoration_delta: float | None
+    multiscale_mae: float | None = None
+    background_multiscale_mae: float | None = None
+    multiscale_restoration_delta: float | None = None
+    coarse_visual_score: float | None = None
+    fine_visual_score: float | None = None
+    fine_visual_gate: float | None = None
+    word_reward_component: float | None = None
+    layout_reward_component: float | None = None
+    coarse_visual_reward_component: float | None = None
+    fine_visual_reward_component: float | None = None
+    outside_penalty_component: float | None = None
+    word_precision: float | None = None
+    word_recall: float | None = None
+    word_score: float | None = None
+    reference_word_count: int = 0
+    predicted_word_count: int = 0
+    matched_word_count: int = 0
+    empty_word_prediction: bool | None = None
+    layout_strict_iou: float | None = None
+    layout_iou: float | None = None
+    layout_precision: float | None = None
+    layout_recall: float | None = None
+    layout_target_coverage: float | None = None
+    layout_predicted_coverage: float | None = None
+    error: str | None = None
+    rendered_image: Image.Image | None = None
+
+
+@dataclass(frozen=True)
+class _RewardAssets:
+    original: np.ndarray
+    background_image: Image.Image
+    background: np.ndarray
+    mask: np.ndarray
+    layout_target: np.ndarray
+    layout_target_dilated: np.ndarray
+    background_masked_mae: float
+    multiscale_levels: tuple["_MultiScaleLevel", ...]
+    background_multiscale_mae: float
+
+
+@dataclass(frozen=True)
+class _MultiScaleLevel:
+    downsample_factor: int
+    blur_radius: float
+    weight: float
+    target: np.ndarray
+    mask: np.ndarray
+
+
+def prepare_text_mask(
+    mask: Image.Image,
+    *,
+    threshold: float,
+    dilation_radius: int,
+    blur_radius: float,
+) -> np.ndarray:
+    """Convert an arbitrary mask to a dilated, soft float mask in ``[0, 1]``."""
+    grayscale = mask.convert("L")
+    cutoff = round(float(threshold) * 255)
+    binary = grayscale.point(lambda value: 255 if value >= cutoff else 0)
+    if dilation_radius:
+        binary = binary.filter(ImageFilter.MaxFilter(2 * int(dilation_radius) + 1))
+    if blur_radius:
+        binary = binary.filter(ImageFilter.GaussianBlur(float(blur_radius)))
+    return np.asarray(binary, dtype=np.float32) / 255.0
+
+
+def masked_rgb_mae(candidate: np.ndarray, target: np.ndarray, mask: np.ndarray) -> float:
+    """Mean absolute RGB error weighted by a 2-D soft mask."""
+    if candidate.shape != target.shape or candidate.ndim != 3 or candidate.shape[2] != 3:
+        raise ValueError(
+            f"candidate and target must be equal HxWx3 arrays, got {candidate.shape} and "
+            f"{target.shape}"
+        )
+    if mask.shape != candidate.shape[:2]:
+        raise ValueError(f"mask shape {mask.shape} does not match image {candidate.shape[:2]}")
+    weight = float(mask.sum())
+    if weight <= 0:
+        return 0.0
+    per_pixel = np.abs(candidate - target).mean(axis=2)
+    return float((per_pixel * mask).sum() / weight)
+
+
+def _multiscale_size(size: tuple[int, int], downsample_factor: int) -> tuple[int, int]:
+    width, height = size
+    return (
+        max(1, math.ceil(width / downsample_factor)),
+        max(1, math.ceil(height / downsample_factor)),
+    )
+
+
+def _transform_multiscale_rgb(
+    image: Image.Image,
+    *,
+    downsample_factor: int,
+    blur_radius: float,
+) -> np.ndarray:
+    transformed = image.convert("RGB")
+    if blur_radius:
+        transformed = transformed.filter(ImageFilter.GaussianBlur(blur_radius))
+    target_size = _multiscale_size(transformed.size, downsample_factor)
+    if transformed.size != target_size:
+        transformed = transformed.resize(target_size, Image.Resampling.BOX)
+    return np.asarray(transformed, dtype=np.float32) / 255.0
+
+
+def _transform_multiscale_mask(
+    mask: np.ndarray,
+    *,
+    source_size: tuple[int, int],
+    downsample_factor: int,
+) -> np.ndarray:
+    encoded = Image.fromarray(
+        np.rint(np.clip(mask, 0.0, 1.0) * 255.0).astype(np.uint8)
+    )
+    if encoded.size != source_size:
+        raise ValueError(
+            f"mask size {encoded.size} does not match source image size {source_size}"
+        )
+    target_size = _multiscale_size(source_size, downsample_factor)
+    if encoded.size != target_size:
+        encoded = encoded.resize(target_size, Image.Resampling.BOX)
+    return np.asarray(encoded, dtype=np.float32) / 255.0
+
+
+def _build_multiscale_levels(
+    original: Image.Image,
+    original_array: np.ndarray,
+    background: Image.Image,
+    mask: np.ndarray,
+    config: PixelMAERewardConfig,
+) -> tuple[tuple[_MultiScaleLevel, ...], float]:
+    weight_sum = float(sum(config.multiscale_weights))
+    levels = []
+    background_mae = 0.0
+    for factor, blur_radius, raw_weight in zip(
+        config.multiscale_downsample_factors,
+        config.multiscale_blur_radii,
+        config.multiscale_weights,
+        strict=True,
+    ):
+        factor = int(factor)
+        blur_radius = float(blur_radius)
+        weight = float(raw_weight) / weight_sum
+        target = (
+            original_array
+            if factor == 1 and blur_radius == 0
+            else _transform_multiscale_rgb(
+                original,
+                downsample_factor=factor,
+                blur_radius=blur_radius,
+            )
+        )
+        level_mask = (
+            mask
+            if factor == 1
+            else _transform_multiscale_mask(
+                mask,
+                source_size=original.size,
+                downsample_factor=factor,
+            )
+        )
+        transformed_background = _transform_multiscale_rgb(
+            background,
+            downsample_factor=factor,
+            blur_radius=blur_radius,
+        )
+        background_mae += weight * masked_rgb_mae(
+            transformed_background,
+            target,
+            level_mask,
+        )
+        levels.append(
+            _MultiScaleLevel(
+                downsample_factor=factor,
+                blur_radius=blur_radius,
+                weight=weight,
+                target=target,
+                mask=level_mask,
+            )
+        )
+    return tuple(levels), float(background_mae)
+
+
+def _score_multiscale_mae(
+    candidate: Image.Image,
+    levels: Sequence[_MultiScaleLevel],
+    *,
+    candidate_array: np.ndarray | None = None,
+) -> float:
+    """Compare candidate and target after identical blur/downsample transforms.
+
+    With a common erased background this measures the rendered-text residual
+    against the original-text residual, without materializing signed images.
+    """
+    total = 0.0
+    for level in levels:
+        transformed = (
+            candidate_array
+            if (
+                candidate_array is not None
+                and level.downsample_factor == 1
+                and level.blur_radius == 0
+            )
+            else _transform_multiscale_rgb(
+                candidate,
+                downsample_factor=level.downsample_factor,
+                blur_radius=level.blur_radius,
+            )
+        )
+        total += level.weight * masked_rgb_mae(
+            transformed,
+            level.target,
+            level.mask,
+        )
+    return float(total)
+
+
+def _completion_text(completion: Any) -> str:
+    if isinstance(completion, str):
+        return completion
+    if not isinstance(completion, Sequence) or isinstance(completion, (bytes, bytearray)):
+        raise TypeError(f"unsupported completion type: {type(completion).__name__}")
+    parts: list[str] = []
+    for message in completion:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content", "")
+        if isinstance(content, str):
+            parts.append(content)
+        elif isinstance(content, Sequence):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(str(block.get("text", "")))
+    if not parts:
+        raise TypeError("completion contains no assistant text")
+    return "".join(parts)
+
+
+def _extract_prediction_texts(completion: str) -> tuple[str, ...]:
+    """Best-effort fallback for renderers that do not return parsed texts."""
+    try:
+        raw = json.loads(completion)
+    except (json.JSONDecodeError, TypeError):
+        return ()
+    objects = raw.get("objects") if isinstance(raw, dict) else None
+    if not isinstance(objects, list):
+        return ()
+    return tuple(
+        text
+        for item in objects
+        if isinstance(item, dict) and isinstance((text := item.get("text")), str)
+    )
+
+
+class PixelMAEReward:
+    """TRL-compatible callable that renders completions and scores reconstruction."""
+
+    def __init__(
+        self,
+        renderer: Any,
+        config: PixelMAERewardConfig | None = None,
+        *,
+        coordinate_codec: CoordinateTokenCodec | None = None,
+    ) -> None:
+        self.config = config or PixelMAERewardConfig()
+        # TRL names Python reward callables through ``__name__`` for metrics.
+        component_count = sum(
+            weight > 0
+            for weight in (
+                self.config.word_reward_weight,
+                self.config.layout_reward_weight,
+                self.config.coarse_visual_reward_weight,
+                self.config.fine_visual_reward_weight,
+            )
+        )
+        self.__name__ = (
+            "reconstruction_composite" if component_count > 1 else "pixel_mae"
+        )
+        self.renderer = renderer
+        self.coordinate_codec = coordinate_codec
+        self._asset_cache: OrderedDict[tuple[str, str, str], _RewardAssets] = OrderedDict()
+        self.last_breakdowns: list[RewardBreakdown] = []
+        self._failure_rewards = {
+            RenderStatus.INVALID_JSON: self.config.invalid_json_reward,
+            RenderStatus.INVALID_SCHEMA: self.config.invalid_schema_reward,
+            RenderStatus.INVALID_SEMANTICS: self.config.invalid_semantics_reward,
+            RenderStatus.UNKNOWN_FONT: self.config.unknown_font_reward,
+            RenderStatus.RENDERER_FAILURE: self.config.renderer_failure_reward,
+        }
+
+    def _load_assets(
+        self,
+        original_path: str | Path,
+        background_path: str | Path,
+        text_mask_path: str | Path,
+    ) -> _RewardAssets:
+        key = (str(original_path), str(background_path), str(text_mask_path))
+        cached = self._asset_cache.get(key)
+        if cached is not None:
+            self._asset_cache.move_to_end(key)
+            return cached
+
+        with Image.open(original_path) as image:
+            original_image = image.convert("RGB")
+            original = np.asarray(original_image, dtype=np.float32) / 255.0
+        with Image.open(background_path) as image:
+            background_image = image.convert("RGB")
+            background = np.asarray(background_image, dtype=np.float32) / 255.0
+        with Image.open(text_mask_path) as image:
+            mask = prepare_text_mask(
+                image,
+                threshold=self.config.mask_threshold,
+                dilation_radius=self.config.mask_dilation_radius,
+                blur_radius=self.config.mask_blur_radius,
+            )
+            layout_target = threshold_layout_mask(
+                image,
+                threshold=self.config.mask_threshold,
+            )
+        layout_target_dilated = dilate_layout_mask(
+            layout_target,
+            kernel_size=self.config.layout_dilation_kernel_size,
+            iterations=self.config.layout_dilation_iterations,
+        )
+        if original.shape != background.shape or mask.shape != original.shape[:2]:
+            raise ValueError(
+                "reward assets have inconsistent dimensions: "
+                f"original={original.shape}, background={background.shape}, mask={mask.shape}"
+            )
+        multiscale_levels, background_multiscale_mae = _build_multiscale_levels(
+            original_image,
+            original,
+            background_image,
+            mask,
+            self.config,
+        )
+        assets = _RewardAssets(
+            original=original,
+            background_image=background_image,
+            background=background,
+            mask=mask,
+            layout_target=layout_target,
+            layout_target_dilated=layout_target_dilated,
+            background_masked_mae=masked_rgb_mae(background, original, mask),
+            multiscale_levels=multiscale_levels,
+            background_multiscale_mae=background_multiscale_mae,
+        )
+        self._asset_cache[key] = assets
+        self._asset_cache.move_to_end(key)
+        while len(self._asset_cache) > self.config.cache_size:
+            self._asset_cache.popitem(last=False)
+        return assets
+
+    def score(
+        self,
+        completion: Any,
+        *,
+        sample_id: str,
+        original_path: str | Path,
+        background_path: str | Path,
+        text_mask_path: str | Path,
+        reference_words: Sequence[Any] | None = None,
+    ) -> RewardBreakdown:
+        assets = self._load_assets(original_path, background_path, text_mask_path)
+        unavailable_words = self._match_words((), reference_words)
+        try:
+            completion_text = _completion_text(completion)
+        except (TypeError, ValueError) as exc:
+            return RewardBreakdown(
+                sample_id=sample_id,
+                status=RenderStatus.INVALID_JSON,
+                reward=self.config.invalid_json_reward,
+                masked_mae=None,
+                outside_mae=None,
+                background_masked_mae=assets.background_masked_mae,
+                restoration_delta=None,
+                background_multiscale_mae=assets.background_multiscale_mae,
+                **self._word_breakdown_kwargs(
+                    unavailable_words, prediction_available=False
+                ),
+                **self._layout_breakdown_kwargs(None, assets),
+                error=str(exc),
+            )
+
+        renderer_completion = decode_coordinate_json_or_original(
+            completion_text,
+            self.coordinate_codec,
+        )
+        outcome = self.renderer.render_prediction(
+            renderer_completion,
+            assets.background_image.copy(),
+            sample_id=sample_id,
+        )
+        prediction_available = (
+            outcome.predicted_texts is not None or outcome.status is RenderStatus.OK
+        )
+        predicted_texts = outcome.predicted_texts
+        if predicted_texts is None:
+            predicted_texts = _extract_prediction_texts(renderer_completion)
+        word_metrics = self._match_words(predicted_texts, reference_words)
+        # INVALID_SEMANTICS can be returned before geometry safety validation
+        # (for example on a wrong canvas), so never rasterize that prediction.
+        layout_safe_statuses = {
+            RenderStatus.OK,
+            RenderStatus.UNKNOWN_FONT,
+            RenderStatus.RENDERER_FAILURE,
+        }
+        layout_metrics = self._match_layout(
+            outcome.prediction if outcome.status in layout_safe_statuses else None,
+            assets,
+        )
+        if outcome.status is not RenderStatus.OK or outcome.image is None:
+            return RewardBreakdown(
+                sample_id=sample_id,
+                status=outcome.status,
+                reward=float(self._failure_rewards[outcome.status]),
+                masked_mae=None,
+                outside_mae=None,
+                background_masked_mae=assets.background_masked_mae,
+                restoration_delta=None,
+                background_multiscale_mae=assets.background_multiscale_mae,
+                **self._word_breakdown_kwargs(
+                    word_metrics, prediction_available=prediction_available
+                ),
+                **self._layout_breakdown_kwargs(layout_metrics, assets),
+                error=outcome.error,
+            )
+
+        if (
+            self.config.reject_empty_word_predictions
+            and word_metrics.active
+            and word_metrics.predicted_count == 0
+        ):
+            return RewardBreakdown(
+                sample_id=sample_id,
+                status=RenderStatus.INVALID_SEMANTICS,
+                reward=float(self.config.invalid_semantics_reward),
+                masked_mae=None,
+                outside_mae=None,
+                background_masked_mae=assets.background_masked_mae,
+                restoration_delta=None,
+                background_multiscale_mae=assets.background_multiscale_mae,
+                **self._word_breakdown_kwargs(
+                    word_metrics, prediction_available=prediction_available
+                ),
+                **self._layout_breakdown_kwargs(layout_metrics, assets),
+                error=(
+                    "prediction contains no lexical words while the OCR reference "
+                    f"contains {word_metrics.reference_count}"
+                ),
+            )
+
+        candidate_image = outcome.image.convert("RGB")
+        candidate = np.asarray(candidate_image, dtype=np.float32) / 255.0
+        masked_mae = masked_rgb_mae(candidate, assets.original, assets.mask)
+        outside_mae = masked_rgb_mae(candidate, assets.background, 1.0 - assets.mask)
+        multiscale_mae = _score_multiscale_mae(
+            candidate_image,
+            assets.multiscale_levels,
+            candidate_array=candidate,
+        )
+        coarse_visual_score = float(np.clip(1.0 - multiscale_mae, 0.0, 1.0))
+        fine_visual_score = float(np.clip(1.0 - masked_mae, 0.0, 1.0))
+
+        # Missing optional supervision is neutral for the gate, while its
+        # corresponding weighted component remains absent. GRPO datasets
+        # normally require OCR words and successful renders always have
+        # layout metrics, but neutral fallbacks preserve pixel-only use cases.
+        word_gate = (
+            float(np.clip(word_metrics.score, 0.0, 1.0))
+            if word_metrics.score is not None
+            else 1.0
+        )
+        layout_gate = (
+            math.sqrt(float(np.clip(layout_metrics.dilated_iou, 0.0, 1.0)))
+            if layout_metrics is not None
+            else 1.0
+        )
+        fine_visual_gate = word_gate * layout_gate
+        word_component = (
+            self.config.word_reward_weight * word_metrics.score
+            if word_metrics.score is not None
+            else 0.0
+        )
+        layout_component = (
+            self.config.layout_reward_weight * layout_metrics.dilated_iou
+            if layout_metrics is not None
+            else 0.0
+        )
+        coarse_visual_component = (
+            self.config.coarse_visual_reward_weight * coarse_visual_score
+        )
+        fine_visual_component = (
+            self.config.fine_visual_reward_weight
+            * fine_visual_score
+            * fine_visual_gate
+        )
+        outside_penalty = self.config.outside_weight * outside_mae
+        reward = (
+            word_component
+            + layout_component
+            + coarse_visual_component
+            + fine_visual_component
+            - outside_penalty
+        )
+        return RewardBreakdown(
+            sample_id=sample_id,
+            status=RenderStatus.OK,
+            reward=float(reward),
+            masked_mae=masked_mae,
+            outside_mae=outside_mae,
+            background_masked_mae=assets.background_masked_mae,
+            restoration_delta=assets.background_masked_mae - masked_mae,
+            multiscale_mae=multiscale_mae,
+            background_multiscale_mae=assets.background_multiscale_mae,
+            multiscale_restoration_delta=(
+                assets.background_multiscale_mae - multiscale_mae
+            ),
+            coarse_visual_score=coarse_visual_score,
+            fine_visual_score=fine_visual_score,
+            fine_visual_gate=fine_visual_gate,
+            word_reward_component=float(word_component),
+            layout_reward_component=float(layout_component),
+            coarse_visual_reward_component=float(coarse_visual_component),
+            fine_visual_reward_component=float(fine_visual_component),
+            outside_penalty_component=float(outside_penalty),
+            **self._word_breakdown_kwargs(
+                word_metrics, prediction_available=prediction_available
+            ),
+            **self._layout_breakdown_kwargs(layout_metrics, assets),
+            rendered_image=outcome.image,
+        )
+
+    def _match_words(
+        self,
+        predicted_texts: Sequence[str],
+        reference_words: Sequence[Any] | None,
+    ) -> WordMatchMetrics:
+        return match_word_content(
+            predicted_texts,
+            reference_words,
+            recall_weight=self.config.word_recall_weight,
+            fuzzy_threshold=self.config.word_fuzzy_threshold,
+            minimum_confidence=self.config.minimum_ocr_confidence,
+        )
+
+    def _match_layout(
+        self,
+        prediction: Any | None,
+        assets: _RewardAssets,
+    ) -> LayoutMaskMetrics | None:
+        if prediction is None:
+            return None
+        predicted = rasterize_protocol_layout_mask(
+            prediction,
+            canvas_size=assets.background_image.size,
+            bezier_samples=self.config.layout_bezier_samples,
+        )
+        return calculate_layout_mask_metrics(
+            predicted,
+            assets.layout_target,
+            dilation_kernel_size=self.config.layout_dilation_kernel_size,
+            dilation_iterations=self.config.layout_dilation_iterations,
+            dilated_target=assets.layout_target_dilated,
+        )
+
+    @staticmethod
+    def _word_breakdown_kwargs(
+        metrics: WordMatchMetrics,
+        *,
+        prediction_available: bool,
+    ) -> dict[str, Any]:
+        return {
+            "word_precision": metrics.precision,
+            "word_recall": metrics.recall,
+            "word_score": metrics.score,
+            "reference_word_count": metrics.reference_count,
+            "predicted_word_count": metrics.predicted_count,
+            "matched_word_count": metrics.matched_count,
+            "empty_word_prediction": (
+                metrics.predicted_count == 0
+                if metrics.active and prediction_available
+                else None
+            ),
+        }
+
+    @staticmethod
+    def _layout_breakdown_kwargs(
+        metrics: LayoutMaskMetrics | None,
+        assets: _RewardAssets,
+    ) -> dict[str, Any]:
+        if metrics is None:
+            return {
+                "layout_strict_iou": None,
+                "layout_iou": None,
+                "layout_precision": None,
+                "layout_recall": None,
+                "layout_target_coverage": float(assets.layout_target_dilated.mean()),
+                "layout_predicted_coverage": None,
+            }
+        area = assets.layout_target.size
+        return {
+            "layout_strict_iou": metrics.strict_iou,
+            "layout_iou": metrics.dilated_iou,
+            "layout_precision": metrics.precision,
+            "layout_recall": metrics.recall,
+            "layout_target_coverage": metrics.target_pixels / area,
+            "layout_predicted_coverage": metrics.predicted_pixels / area,
+        }
+
+    def __call__(self, completions: Sequence[Any], **kwargs: Any) -> list[float]:
+        required = ("sample_id", "original_path", "background_path", "text_mask_path")
+        missing = [name for name in required if name not in kwargs]
+        if missing:
+            raise ValueError(f"reward call is missing dataset columns: {', '.join(missing)}")
+
+        breakdowns: list[RewardBreakdown] = []
+        memo: dict[tuple[str, str, str, str, str, str], RewardBreakdown] = {}
+        for index, completion in enumerate(completions):
+            values = {name: kwargs[name][index] for name in required}
+            reference_columns = kwargs.get("reference_words")
+            values["reference_words"] = (
+                reference_columns[index] if reference_columns is not None else []
+            )
+            try:
+                completion_key = _completion_text(completion)
+            except TypeError:
+                completion_key = repr(completion)
+            key = (
+                str(values["sample_id"]),
+                str(values["original_path"]),
+                str(values["background_path"]),
+                str(values["text_mask_path"]),
+                repr(values["reference_words"]),
+                completion_key,
+            )
+            breakdown = memo.get(key)
+            if breakdown is None:
+                breakdown = self.score(completion, **values)
+                memo[key] = breakdown
+            breakdowns.append(breakdown)
+        self.last_breakdowns = breakdowns
+        return [item.reward for item in breakdowns]

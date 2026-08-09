@@ -14,12 +14,18 @@ CANONICALIZER_VERSION = "1.0.0"
 DEFAULT_DECIMAL_PLACES = 3
 
 
-def project_protocol(value: DatasetProtocol | Mapping[str, Any]) -> PredictionProtocol:
+def project_protocol(
+    value: DatasetProtocol | Mapping[str, Any],
+    *,
+    text_only: bool = False,
+) -> PredictionProtocol:
     """Remove dataset-only fields while preserving semantic object IDs."""
     protocol = validate_dataset_protocol(value)
     ordered = sorted(protocol.objects, key=lambda obj: (obj.z_order, obj.id))
     objects = []
     for obj in ordered:
+        if text_only and not hasattr(obj, "text"):
+            continue
         excluded = {"tight_bbox", "annotation"}
         if protocol.protocol_version == "1.0":
             excluded.add("object_type")
@@ -60,6 +66,7 @@ def canonicalize(
     value: DatasetProtocol | PredictionProtocol | Mapping[str, Any] | str,
     *,
     decimal_places: int = DEFAULT_DECIMAL_PLACES,
+    text_only: bool = False,
 ) -> str:
     """Return the one canonical JSON representation of a prediction target."""
     if decimal_places < 0:
@@ -70,11 +77,24 @@ def canonicalize(
     if isinstance(value, DatasetProtocol) or (
         isinstance(value, Mapping) and "sample_id" in value
     ):
-        target = project_protocol(value)
+        target = project_protocol(value, text_only=text_only)
     elif isinstance(value, PredictionProtocol):
         target = PredictionProtocol.model_validate(value)
     else:
         target = PredictionProtocol.model_validate(value)
+
+    if text_only and any(not hasattr(obj, "text") for obj in target.objects):
+        target = PredictionProtocol.model_validate(
+            {
+                "protocol_version": target.protocol_version,
+                "canvas": target.canvas.model_dump(mode="python"),
+                "objects": [
+                    obj.model_dump(mode="python")
+                    for obj in target.objects
+                    if hasattr(obj, "text")
+                ],
+            }
+        )
 
     normalized = _normalize(target.model_dump(mode="python"), decimal_places)
     return json.dumps(

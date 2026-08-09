@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader, Subset
 from ..evaluation.runner import evaluate_generation
 from .collator import ProtocolGenerationCollator
 from .prompts import ProtocolPromptTemplate
+from .tracking import store_hydra_config
 
 
 @dataclass
@@ -54,11 +55,21 @@ def _save_checkpoint(
     if accelerator.is_main_process:
         artifact_dir = checkpoint_dir / "model"
         unwrapped = accelerator.unwrap_model(model)
+        save_kwargs: dict[str, Any] = {}
+        peft_configs = getattr(unwrapped, "peft_config", {})
+        if any(
+            getattr(peft_config, "trainable_token_indices", None)
+            for peft_config in peft_configs.values()
+        ):
+            # TrainableTokens stores only the selected-row deltas in the
+            # adapter. Avoid PEFT's automatic full embedding-matrix export.
+            save_kwargs["save_embedding_layers"] = False
         unwrapped.save_pretrained(
             artifact_dir,
             is_main_process=True,
             save_function=accelerator.save,
             safe_serialization=True,
+            **save_kwargs,
         )
         processor.save_pretrained(artifact_dir)
         (checkpoint_dir / "trainer_state.json").write_text(
@@ -149,6 +160,7 @@ def train_sft(
     train_dataset: Any,
     validation_dataset: Any,
     collator: Any,
+    prompt_template: ProtocolPromptTemplate,
 ) -> TrainerState:
     from accelerate import Accelerator
     from accelerate.utils import set_seed
@@ -195,7 +207,7 @@ def train_sft(
             shuffle=False,
             collate_fn=ProtocolGenerationCollator(
                 processor=processor,
-                prompt_template=ProtocolPromptTemplate(),
+                prompt_template=prompt_template,
             ),
             num_workers=int(cfg.dataset.num_workers),
             pin_memory=True,
@@ -227,9 +239,14 @@ def train_sft(
     if tracker_name is not None:
         accelerator.init_trackers(
             project_name=str(cfg.tracking.project),
-            config=resolved_config,
             init_kwargs=tracker_init_kwargs,
         )
+        if accelerator.is_main_process:
+            store_hydra_config(
+                tracker_name,
+                accelerator.get_tracker(tracker_name, unwrap=True),
+                resolved_config,
+            )
     output_dir = Path(cfg.training.output_dir)
     state = TrainerState()
     if cfg.training.resume_from:
@@ -322,6 +339,8 @@ def train_sft(
                         dataloader=generation_loader,
                         max_new_tokens=int(cfg.evaluation.generation.max_new_tokens),
                         progress_bar=bool(cfg.training.progress_bar),
+                        coordinate_codec=prompt_template.coordinate_codec,
+                        decimal_places=int(cfg.protocol.decimal_places),
                     )
                     evaluation_metrics.update(validity.as_log_dict())
                 accelerator.log(evaluation_metrics, step=state.global_step)

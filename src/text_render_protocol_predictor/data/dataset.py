@@ -15,6 +15,7 @@ from .structural_noise import (
     apply_structural_noise,
 )
 from ..protocol.canonicalizer import canonicalize
+from ..protocol.coordinate_tokens import CoordinateTokenCodec
 from ..protocol.schema import DatasetProtocol
 from ..protocol.validator import validate_dataset_protocol
 
@@ -47,6 +48,8 @@ class ProtocolManifestDataset:
         verify_image_dimensions: bool = True,
         max_objects: int | None = None,
         structural_noise: StructuralNoiseConfig | None = None,
+        coordinate_codec: CoordinateTokenCodec | None = None,
+        text_only_targets: bool = False,
     ) -> None:
         self.dataset_root = Path(dataset_root).expanduser().resolve()
         manifest = Path(manifest_path)
@@ -61,6 +64,8 @@ class ProtocolManifestDataset:
         self.verify_image_dimensions = verify_image_dimensions
         self.max_objects = max_objects
         self.structural_noise = structural_noise or StructuralNoiseConfig()
+        self.coordinate_codec = coordinate_codec
+        self.text_only_targets = text_only_targets
 
     def __len__(self) -> int:
         return len(self.entries)
@@ -83,9 +88,13 @@ class ProtocolManifestDataset:
             raw_protocol = json.load(stream)
         protocol = validate_dataset_protocol(raw_protocol, font_ids=self.font_ids)
         self._validate_envelope(entry, protocol)
-        if self.max_objects is not None and len(protocol.objects) > self.max_objects:
+        target_object_count = sum(
+            not self.text_only_targets or hasattr(obj, "text")
+            for obj in protocol.objects
+        )
+        if self.max_objects is not None and target_object_count > self.max_objects:
             raise ValueError(
-                f"sample {entry.sample_id!r} has {len(protocol.objects)} objects; "
+                f"sample {entry.sample_id!r} has {target_object_count} target objects; "
                 f"configured maximum is {self.max_objects}"
             )
         if self.verify_image_dimensions and image_path.is_file():
@@ -101,6 +110,18 @@ class ProtocolManifestDataset:
             seed=self.structural_noise.seed + protocol.seed,
             object_groups=entry.structural_groups,
         )
+        if self.coordinate_codec is None:
+            canonical_protocol = canonicalize(
+                protocol,
+                decimal_places=self.decimal_places,
+                text_only=self.text_only_targets,
+            )
+        else:
+            canonical_protocol = self.coordinate_codec.encode_json(
+                protocol,
+                decimal_places=self.decimal_places,
+                text_only=self.text_only_targets,
+            )
         return ProtocolDatasetRecord(
             sample_id=entry.sample_id,
             image_path=image_path,
@@ -110,7 +131,7 @@ class ProtocolManifestDataset:
             protocol_version=protocol.protocol_version,
             purpose=getattr(protocol, "purpose", "render"),
             protocol=protocol,
-            canonical_protocol=canonicalize(protocol, decimal_places=self.decimal_places),
+            canonical_protocol=canonical_protocol,
             seed=protocol.seed,
         )
 

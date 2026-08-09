@@ -1,0 +1,104 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import pytest
+from PIL import Image
+
+from text_render_protocol_predictor.training import ProtocolPromptTemplate
+from text_render_protocol_predictor.training.grpo_trainer import (
+    _append_finite_metric,
+    _append_rendered_images_to_rows,
+    build_hf_grpo_dataset,
+    grpo_conversation,
+)
+from text_render_protocol_predictor.protocol import CoordinateTokenCodec
+
+
+@dataclass
+class Record:
+    sample_id: str
+    image_path: object
+    background_path: object
+    text_mask_path: object
+    canvas_width: int = 16
+    canvas_height: int = 12
+    mask_coverage: float = 0.1
+    words: tuple = ()
+
+
+class Records:
+    def __init__(self, record):
+        self.record = record
+
+    def __len__(self):
+        return 1
+
+    def __getitem__(self, index):
+        assert index == 0
+        return self.record
+
+
+def test_grpo_conversation_leaves_image_in_separate_dataset_column():
+    messages = grpo_conversation(width=16, height=12, protocol_version="2.1")
+
+    assert [message["role"] for message in messages] == ["system", "user"]
+    assert "Canvas size: 16 x 12" in messages[1]["content"]
+    assert "Use protocol version 2.1" in messages[1]["content"]
+    assert "Do not include shape objects" in messages[1]["content"]
+    assert isinstance(messages[1]["content"], str)
+
+
+def test_grpo_conversation_requests_atomic_coordinates():
+    messages = grpo_conversation(
+        width=900,
+        height=1200,
+        protocol_version="2.1",
+        prompt_template=ProtocolPromptTemplate(
+            coordinate_codec=CoordinateTokenCodec()
+        ),
+    )
+
+    text = messages[1]["content"]
+    assert '"<coord_000>" through "<coord_511>"' in text
+    assert "Normalize horizontal values by canvas width" in text
+
+
+def test_hf_dataset_exposes_original_to_policy_and_reward_paths(tmp_path):
+    pytest.importorskip("datasets")
+    paths = []
+    for name in ("original", "background", "mask"):
+        path = tmp_path / f"{name}.webp"
+        Image.new("RGB", (16, 12)).save(path, format="WEBP", lossless=True)
+        paths.append(path)
+    dataset = build_hf_grpo_dataset(
+        Records(Record("sample", *paths)),
+        protocol_version="2.1",
+    )
+
+    row = dataset[0]
+    assert row["image"].size == (16, 12)
+    assert row["original_path"] == str(paths[0])
+    assert row["background_path"] == str(paths[1])
+    assert row["text_mask_path"] == str(paths[2])
+    assert row["reference_words"] == []
+    assert "Use protocol version 2.1" in row["prompt"][1]["content"]
+    assert "Do not include shape objects" in row["prompt"][1]["content"]
+
+
+def test_appends_rendered_candidates_to_matching_completion_rows():
+    originals = [["original-a"], ["original-b"]]
+
+    count = _append_rendered_images_to_rows(originals, ["rendered-a", None])
+
+    assert count == 1
+    assert originals == [["original-a", "rendered-a"], ["original-b"]]
+
+
+def test_skips_non_finite_batch_metric_in_epoch_aggregation():
+    metrics = {"reconstruction/masked_mae": [0.2]}
+
+    assert not _append_finite_metric(
+        metrics, "reconstruction/masked_mae", float("nan")
+    )
+    assert metrics["reconstruction/masked_mae"] == [0.2]
