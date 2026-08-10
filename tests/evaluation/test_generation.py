@@ -38,6 +38,9 @@ def test_generation_task_metrics_are_perfect_for_exact_prediction(
     metrics = evaluate_generation_predictions([target], [target])
 
     assert metrics.box_iou == 1.0
+    assert metrics.oriented_box_iou == 1.0
+    assert metrics.angle_mae == 0.0
+    assert metrics.geometry_mode_accuracy == 1.0
     assert metrics.character_error_rate == 0.0
     assert metrics.word_error_rate == 0.0
     assert metrics.font_accuracy == 1.0
@@ -70,6 +73,7 @@ def test_generation_task_metrics_measure_bezier_and_rgb_errors(protocol_dict: di
 
     assert metrics.bezier_mse == 2.0
     assert metrics.bezier_coordinate_count == 8
+    assert metrics.bezier_centerline_error > 0
     assert metrics.color_mae == pytest.approx(5.0)
     assert metrics.color_channel_count == 6
 

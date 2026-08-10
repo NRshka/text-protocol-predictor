@@ -24,10 +24,17 @@ def main(cfg: DictConfig) -> None:
             "it cannot be combined with training.resume_from"
         )
     coordinate_codec = coordinate_codec_from_config(cfg.protocol)
+    grounding_enabled = bool(cfg.grounding.enabled)
+    if grounding_enabled and bool(cfg.augmentation.structural_noise.enabled):
+        raise ValueError(
+            "grounded mask training cannot use structural annotation noise; "
+            "transform image, protocol, and masks together in the dataset generator"
+        )
     text_only = bool(cfg.protocol.text_only)
     prompt_template = ProtocolPromptTemplate(
         coordinate_codec=coordinate_codec,
         text_only=text_only,
+        grounding_enabled=grounding_enabled,
     )
     common = {
         "dataset_root": cfg.dataset.root_dir,
@@ -36,6 +43,7 @@ def main(cfg: DictConfig) -> None:
         "max_objects": int(cfg.protocol.max_objects),
         "coordinate_codec": coordinate_codec,
         "text_only_targets": text_only,
+        "grounding_enabled": grounding_enabled,
     }
     train_dataset = ProtocolManifestDataset(
         manifest_path=cfg.dataset.manifests.train,
@@ -52,13 +60,19 @@ def main(cfg: DictConfig) -> None:
         validate_dataset(train_dataset).raise_for_errors()
         validate_dataset(validation_dataset).raise_for_errors()
     model, processor = load_qwen3_vl_for_sft(
-        cfg.model, cfg.lora, coordinate_codec=coordinate_codec
+        cfg.model,
+        cfg.lora,
+        coordinate_codec=coordinate_codec,
+        grounding_cfg=cfg.grounding,
     )
     collator = ProtocolSFTCollator(
         processor=processor,
         prompt_template=prompt_template,
         max_sequence_tokens=int(cfg.model.max_sequence_tokens),
         max_output_tokens=int(cfg.model.max_output_tokens),
+        mask_token_id=getattr(model, "mask_token_id", None),
+        vision_patch_size=int(getattr(model, "vision_patch_size", 16)),
+        mask_output_stride=int(cfg.grounding.decoder.output_stride),
     )
     train_sft(
         cfg=cfg,

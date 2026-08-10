@@ -6,6 +6,15 @@ from .coordinate_tokens import (
     coordinate_codec_from_config,
     decode_coordinate_json_or_original,
 )
+from .grounding import (
+    GROUNDING_FORMAT_VERSION,
+    MASK_REFERENCE_FIELD,
+    MASK_TOKEN,
+    MASK_TOKENIZER_SURFACE,
+    GroundingStripResult,
+    ground_protocol_json,
+    strip_mask_references,
+)
 from .schema import (
     DatasetProtocol,
     DatasetProtocolV1,
@@ -24,6 +33,11 @@ __all__ = [
     "CANONICALIZER_VERSION",
     "COORDINATE_ENCODING_VERSION",
     "DEFAULT_COORDINATE_BINS",
+    "GROUNDING_FORMAT_VERSION",
+    "GroundingStripResult",
+    "MASK_REFERENCE_FIELD",
+    "MASK_TOKEN",
+    "MASK_TOKENIZER_SURFACE",
     "CoordinateTokenCodec",
     "DatasetProtocol",
     "DatasetProtocolV1",
@@ -39,6 +53,8 @@ __all__ = [
     "coordinate_codec_from_config",
     "decode_coordinate_json_or_original",
     "detect_protocol_version",
+    "ground_protocol_json",
     "project_protocol",
+    "strip_mask_references",
     "validate_dataset_protocol",
 ]

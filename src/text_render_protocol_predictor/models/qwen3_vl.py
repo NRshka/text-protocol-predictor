@@ -9,6 +9,14 @@ from pathlib import Path
 from typing import Any
 
 from ..protocol.coordinate_tokens import CoordinateTokenCodec
+from ..protocol.grounding import MASK_TOKENIZER_SURFACE
+from .grounded_qwen3_vl import (
+    GROUNDING_CONFIG_FILE,
+    GROUNDING_WEIGHTS_FILE,
+    GroundedDecoderConfig,
+    GroundedQwen3VL,
+    load_grounding_config,
+)
 
 
 DEFAULT_LORA_LEAVES = (
@@ -19,6 +27,13 @@ DEFAULT_LORA_LEAVES = (
     "gate_proj",
     "up_proj",
     "down_proj",
+)
+
+DEFAULT_VISION_LORA_LEAVES = (
+    "qkv",
+    "proj",
+    "linear_fc1",
+    "linear_fc2",
 )
 
 REQUIRED_PEFT_WEIGHT_FILES = (
@@ -38,6 +53,112 @@ class CoordinateTokenRegistration:
     token_ids: tuple[int, ...]
     source_token_ids: tuple[tuple[int, ...], ...]
     new_token_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class MaskTokenRegistration:
+    token_id: int
+    source_token_ids: tuple[int, ...]
+    is_new: bool
+
+
+def add_mask_token(tokenizer: Any) -> MaskTokenRegistration:
+    """Register the quoted mask reference as one regular tokenizer token."""
+    from transformers import AddedToken
+
+    source_ids = tuple(tokenizer.encode(json.dumps("mask"), add_special_tokens=False))
+    if not source_ids:
+        raise ValueError("tokenizer could not encode the mask-token initializer")
+    existing = tokenizer.get_vocab()
+    is_new = MASK_TOKENIZER_SURFACE not in existing
+    tokenizer.add_tokens(
+        [AddedToken(MASK_TOKENIZER_SURFACE, special=False, normalized=False)],
+        special_tokens=False,
+    )
+    ids = tokenizer.encode(MASK_TOKENIZER_SURFACE, add_special_tokens=False)
+    if len(ids) != 1:
+        raise ValueError(
+            f"mask tokenizer surface encoded as {len(ids)} tokens instead of one"
+        )
+    token_id = int(ids[0])
+    if token_id in set(getattr(tokenizer, "all_special_ids", ())):
+        raise ValueError("mask token must be regular rather than special")
+    decoded = tokenizer.decode(
+        [token_id],
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
+    if decoded != MASK_TOKENIZER_SURFACE:
+        raise ValueError(
+            f"mask tokenizer surface decodes as {decoded!r}, expected "
+            f"{MASK_TOKENIZER_SURFACE!r}"
+        )
+    return MaskTokenRegistration(token_id, source_ids, is_new)
+
+
+def resize_and_initialize_mask_embedding(
+    model: Any,
+    tokenizer: Any,
+    registration: MaskTokenRegistration,
+    *,
+    initialize_all: bool = False,
+) -> None:
+    """Resize and initialize a new mask vocabulary row from the word ``mask``."""
+    import torch
+
+    old_vocab_size = int(model.get_input_embeddings().weight.shape[0])
+    target_vocab_size = max(len(tokenizer), old_vocab_size)
+    if target_vocab_size != old_vocab_size:
+        model.resize_token_embeddings(target_vocab_size, mean_resizing=False)
+    if not registration.is_new and not initialize_all:
+        return
+    input_embeddings = model.get_input_embeddings()
+    output_embeddings = model.get_output_embeddings()
+    source_ids = torch.tensor(
+        registration.source_token_ids,
+        device=input_embeddings.weight.device,
+    )
+    with torch.no_grad():
+        input_embeddings.weight[registration.token_id].copy_(
+            input_embeddings.weight.index_select(0, source_ids).mean(dim=0)
+        )
+        if output_embeddings is not None and (
+            output_embeddings.weight.data_ptr() != input_embeddings.weight.data_ptr()
+        ):
+            output_source_ids = source_ids.to(output_embeddings.weight.device)
+            output_embeddings.weight[registration.token_id].copy_(
+                output_embeddings.weight.index_select(0, output_source_ids).mean(dim=0)
+            )
+
+
+def add_trainable_token_index(
+    indices: list[int] | dict[str, list[int]] | None,
+    token_id: int,
+) -> list[int] | dict[str, list[int]]:
+    """Add one vocabulary ID to PEFT's selective input/output token rows."""
+    if indices is None:
+        return [token_id]
+    if isinstance(indices, dict):
+        return {
+            name: list(dict.fromkeys([*values, token_id]))
+            for name, values in indices.items()
+        }
+    return list(dict.fromkeys([*indices, token_id]))
+
+
+def trainable_token_indices_for_model(
+    model: Any,
+    token_ids: Sequence[int],
+) -> list[int] | dict[str, list[int]]:
+    """Select input and, when untied, output vocabulary rows."""
+    input_embeddings = model.get_input_embeddings()
+    output_embeddings = model.get_output_embeddings()
+    indices = [int(token_id) for token_id in token_ids]
+    if output_embeddings is None or (
+        output_embeddings.weight.data_ptr() == input_embeddings.weight.data_ptr()
+    ):
+        return indices
+    return {"embed_tokens": indices, "lm_head": indices}
 
 
 def add_coordinate_tokens(
@@ -168,14 +289,7 @@ def coordinate_trainable_token_indices(
     model: Any, registration: CoordinateTokenRegistration
 ) -> list[int] | dict[str, list[int]]:
     """Select both vocabulary layers when Qwen's input/output weights are untied."""
-    input_embeddings = model.get_input_embeddings()
-    output_embeddings = model.get_output_embeddings()
-    indices = list(registration.token_ids)
-    if output_embeddings is None or (
-        output_embeddings.weight.data_ptr() == input_embeddings.weight.data_ptr()
-    ):
-        return indices
-    return {"embed_tokens": indices, "lm_head": indices}
+    return trainable_token_indices_for_model(model, registration.token_ids)
 
 
 def _validate_adapter_coordinate_tokens(
@@ -249,10 +363,55 @@ def language_lora_targets(
     return targets
 
 
+def _vision_model_with_prefix(model: Any) -> tuple[str, Any]:
+    candidates = [model, getattr(model, "model", None)]
+    for candidate in candidates:
+        if candidate is not None and hasattr(candidate, "visual"):
+            visual = candidate.visual
+            for name, module in model.named_modules():
+                if module is visual:
+                    return name, visual
+    raise ValueError("could not locate Qwen3-VL visual module")
+
+
+def vision_lora_targets(
+    model: Any,
+    *,
+    final_blocks: int = 6,
+    leaves: Sequence[str] = DEFAULT_VISION_LORA_LEAVES,
+) -> list[str]:
+    """Return exact projections in the final vision blocks for the ablation."""
+    import torch
+
+    prefix, visual = _vision_model_with_prefix(model)
+    depth = len(visual.blocks)
+    if not 1 <= final_blocks <= depth:
+        raise ValueError(
+            f"vision LoRA final_blocks must be within 1..{depth}, got {final_blocks}"
+        )
+    first_block = depth - final_blocks
+    allowed = set(leaves)
+    targets = [
+        f"{prefix}.blocks.{block_index}.{name}"
+        for block_index in range(first_block, depth)
+        for name, module in visual.blocks[block_index].named_modules()
+        if name and name.rsplit(".", 1)[-1] in allowed
+        and isinstance(module, torch.nn.Linear)
+    ]
+    expected = final_blocks * len(allowed)
+    if len(targets) != expected:
+        raise ValueError(
+            f"expected {expected} vision LoRA projections in the final "
+            f"{final_blocks} blocks, found {len(targets)}"
+        )
+    return targets
+
+
 def load_qwen3_vl_for_sft(
     model_cfg: Any,
     lora_cfg: Any,
     coordinate_codec: CoordinateTokenCodec | None = None,
+    grounding_cfg: Any | None = None,
 ) -> tuple[Any, Any]:
     """Load the processor and model, optionally attaching decoder-only LoRA."""
     import torch
@@ -264,6 +423,7 @@ def load_qwen3_vl_for_sft(
         raise ValueError(f"unsupported precision: {model_cfg.precision}")
 
     weights_path = getattr(model_cfg, "weights_path", None)
+    grounding_enabled = bool(getattr(grounding_cfg, "enabled", False))
     if weights_path and not bool(lora_cfg.enabled):
         raise ValueError("model.weights_path contains PEFT weights, so lora.enabled must be true")
     if weights_path:
@@ -286,6 +446,7 @@ def load_qwen3_vl_for_sft(
         attn_implementation=getattr(model_cfg, "attn_implementation", "sdpa"),
     )
     coordinate_registration = None
+    mask_registration = None
     trainable_token_indices = None
     if coordinate_codec is not None:
         coordinate_registration = add_coordinate_tokens(
@@ -306,6 +467,37 @@ def load_qwen3_vl_for_sft(
         # TrainableTokens wrappers before loading adapter state, so the base
         # vocabulary must already contain every referenced row.
         resize_model_to_tokenizer_vocabulary(model, processor.tokenizer)
+    if grounding_enabled:
+        if not bool(lora_cfg.enabled):
+            raise ValueError("grounded SFT requires LoRA for selective trainable token rows")
+        if resolved_weights_path is not None:
+            missing_grounding = [
+                name
+                for name in (GROUNDING_CONFIG_FILE, GROUNDING_WEIGHTS_FILE)
+                if not (resolved_weights_path / name).is_file()
+            ]
+            if missing_grounding:
+                raise ValueError(
+                    "grounded SFT cannot initialize from a legacy adapter missing: "
+                    + ", ".join(missing_grounding)
+                )
+        mask_registration = add_mask_token(processor.tokenizer)
+        resize_and_initialize_mask_embedding(
+            model,
+            processor.tokenizer,
+            mask_registration,
+            initialize_all=resolved_weights_path is not None,
+        )
+        if trainable_token_indices is None:
+            trainable_token_indices = trainable_token_indices_for_model(
+                model,
+                [mask_registration.token_id],
+            )
+        else:
+            trainable_token_indices = add_trainable_token_index(
+                trainable_token_indices,
+                mask_registration.token_id,
+            )
     if bool(model_cfg.gradient_checkpointing):
         model.gradient_checkpointing_enable()
         model.config.use_cache = False
@@ -329,6 +521,14 @@ def load_qwen3_vl_for_sft(
         if str(lora_cfg.target_scope) != "language_decoder":
             raise ValueError("the initial SFT implementation supports language_decoder LoRA only")
         targets = language_lora_targets(model)
+        vision_lora_cfg = getattr(grounding_cfg, "vision_lora", None)
+        if grounding_enabled and bool(getattr(vision_lora_cfg, "enabled", False)):
+            targets.extend(
+                vision_lora_targets(
+                    model,
+                    final_blocks=int(getattr(vision_lora_cfg, "final_blocks", 6)),
+                )
+            )
         peft_config = LoraConfig(
             r=int(lora_cfg.rank),
             lora_alpha=int(lora_cfg.alpha),
@@ -343,5 +543,29 @@ def load_qwen3_vl_for_sft(
         base = getattr(model, "model", model)
         if bool(model_cfg.freeze_vision_tower) and hasattr(base, "visual"):
             base.visual.requires_grad_(False)
+
+    if grounding_enabled:
+        if mask_registration is None:
+            raise RuntimeError("grounded model has no registered mask token")
+        if resolved_weights_path is not None:
+            decoder_config, saved_mask_token_id = load_grounding_config(
+                resolved_weights_path
+            )
+            if saved_mask_token_id != mask_registration.token_id:
+                raise ValueError(
+                    "grounding checkpoint mask token ID does not match its tokenizer"
+                )
+        else:
+            decoder_config = GroundedDecoderConfig.from_mapping(
+                getattr(grounding_cfg, "decoder", grounding_cfg)
+            )
+        model = GroundedQwen3VL(
+            model,
+            mask_token_id=mask_registration.token_id,
+            decoder_config=decoder_config,
+        )
+        if resolved_weights_path is not None:
+            model.load_grounding_pretrained(resolved_weights_path)
+        model.set_training_phase(str(getattr(grounding_cfg, "phase", "joint")))
 
     return model, processor

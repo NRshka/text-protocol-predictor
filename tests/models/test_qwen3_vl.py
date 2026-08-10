@@ -7,11 +7,13 @@ import torch
 
 from text_render_protocol_predictor.models.qwen3_vl import (
     REQUIRED_PEFT_WEIGHT_FILES,
+    add_mask_token,
     add_coordinate_tokens,
     coordinate_trainable_token_indices,
     inspect_peft_weights_directory,
     resize_and_initialize_coordinate_embeddings,
     resize_model_to_tokenizer_vocabulary,
+    vision_lora_targets,
 )
 from text_render_protocol_predictor.protocol import CoordinateTokenCodec
 
@@ -164,6 +166,30 @@ def test_coordinate_json_value_is_one_regular_token() -> None:
     assert coordinate_id not in tokenizer.all_special_ids
 
 
+def test_mask_json_value_is_one_regular_token() -> None:
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    backend = Tokenizer(
+        models.WordLevel({"[UNK]": 0, "mask": 1}, unk_token="[UNK]")
+    )
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        unk_token="[UNK]",
+    )
+
+    registration = add_mask_token(tokenizer)
+
+    assert tokenizer.encode('"<MASK>"', add_special_tokens=False) == [
+        registration.token_id
+    ]
+    assert tokenizer.decode(
+        [registration.token_id], skip_special_tokens=True
+    ) == '"<MASK>"'
+    assert registration.token_id not in tokenizer.all_special_ids
+
+
 def test_new_tokens_initialize_inside_preallocated_model_vocabulary() -> None:
     tokenizer = _FakeTokenizer()
     registration = add_coordinate_tokens(tokenizer, CoordinateTokenCodec(bins=4))
@@ -193,3 +219,29 @@ def test_expanded_checkpoint_tokenizer_resizes_base_before_peft_loading() -> Non
     assert model.embed_tokens.weight.shape[0] == 8
     assert model.lm_head.weight.shape[0] == 8
     assert resize_model_to_tokenizer_vocabulary(model, tokenizer) is False
+
+
+def test_vision_lora_targets_only_final_requested_blocks() -> None:
+    class Block(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attn = torch.nn.Module()
+            self.attn.qkv = torch.nn.Linear(2, 2)
+            self.attn.proj = torch.nn.Linear(2, 2)
+            self.mlp = torch.nn.Module()
+            self.mlp.linear_fc1 = torch.nn.Linear(2, 2)
+            self.mlp.linear_fc2 = torch.nn.Linear(2, 2)
+
+    class Model(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.model = torch.nn.Module()
+            self.model.visual = torch.nn.Module()
+            self.model.visual.blocks = torch.nn.ModuleList(
+                [Block() for _ in range(4)]
+            )
+
+    targets = vision_lora_targets(Model(), final_blocks=2)
+
+    assert len(targets) == 8
+    assert all("blocks.2" in name or "blocks.3" in name for name in targets)

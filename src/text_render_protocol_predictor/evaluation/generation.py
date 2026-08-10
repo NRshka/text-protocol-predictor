@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from pydantic import ValidationError
 
+from .geometry import angle_error_degrees, bezier_centerline_error, oriented_box_iou
 from ..protocol.schema import (
     BoundingBox,
     LinearGradientFill,
@@ -41,6 +42,37 @@ class GenerationValidityMetrics:
     color_absolute_error_sum: float = 0.0
     color_channel_count: int = 0
     has_ground_truth: bool = False
+    grounding_evaluated_count: int = 0
+    grounding_valid_count: int = 0
+    mask_evaluated_count: int = 0
+    mask_target_count: int = 0
+    mask_prediction_count: int = 0
+    mask_attached_iou_sum: float = 0.0
+    mask_oracle_iou_sum: float = 0.0
+    mask_dice_sum: float = 0.0
+    mask_boundary_fscore_sum: float = 0.0
+    mask_ap50_sum: float = 0.0
+    mask_ap75_sum: float = 0.0
+    oriented_box_iou_sum: float = 0.0
+    oriented_box_count: int = 0
+    angle_absolute_error_sum: float = 0.0
+    angle_count: int = 0
+    geometry_mode_correct_count: int = 0
+    geometry_mode_count: int = 0
+    bezier_centerline_error_sum: float = 0.0
+    bezier_centerline_count: int = 0
+    serialized_geometry_mask_iou_sum: float = 0.0
+    serialized_geometry_mask_count: int = 0
+    auxiliary_geometry_count: int = 0
+    auxiliary_geometry_mode_correct_count: int = 0
+    auxiliary_oriented_box_iou_sum: float = 0.0
+    auxiliary_angle_absolute_error_sum: float = 0.0
+    auxiliary_bezier_count: int = 0
+    auxiliary_bezier_centerline_error_sum: float = 0.0
+    grounding_slice_metrics: dict[str, int | float] = field(default_factory=dict)
+    generation_latency_seconds_sum: float = 0.0
+    generation_latency_count: int = 0
+    peak_memory_bytes: int = 0
 
     @property
     def valid_json_percent(self) -> float:
@@ -53,6 +85,100 @@ class GenerationValidityMetrics:
         if self.evaluated_count == 0:
             return 0.0
         return 100.0 * self.schema_valid_count / self.evaluated_count
+
+    @property
+    def grounding_valid_percent(self) -> float:
+        if self.grounding_evaluated_count == 0:
+            return 0.0
+        return 100.0 * self.grounding_valid_count / self.grounding_evaluated_count
+
+    @property
+    def mask_attached_iou(self) -> float:
+        if self.mask_target_count == 0:
+            return 0.0
+        return self.mask_attached_iou_sum / self.mask_target_count
+
+    @property
+    def mask_oracle_iou(self) -> float:
+        if self.mask_target_count == 0:
+            return 0.0
+        return self.mask_oracle_iou_sum / self.mask_target_count
+
+    @property
+    def mask_association_gap(self) -> float:
+        return max(0.0, self.mask_oracle_iou - self.mask_attached_iou)
+
+    @property
+    def oriented_box_iou(self) -> float:
+        if self.oriented_box_count == 0:
+            return 0.0
+        return self.oriented_box_iou_sum / self.oriented_box_count
+
+    @property
+    def angle_mae(self) -> float:
+        if self.angle_count == 0:
+            return 0.0
+        return self.angle_absolute_error_sum / self.angle_count
+
+    @property
+    def geometry_mode_accuracy(self) -> float:
+        if self.geometry_mode_count == 0:
+            return 0.0
+        return self.geometry_mode_correct_count / self.geometry_mode_count
+
+    @property
+    def bezier_centerline_error(self) -> float:
+        if self.bezier_centerline_count == 0:
+            return 0.0
+        return self.bezier_centerline_error_sum / self.bezier_centerline_count
+
+    @property
+    def serialized_geometry_mask_iou(self) -> float:
+        if self.serialized_geometry_mask_count == 0:
+            return 0.0
+        return (
+            self.serialized_geometry_mask_iou_sum
+            / self.serialized_geometry_mask_count
+        )
+
+    @property
+    def auxiliary_geometry_mode_accuracy(self) -> float:
+        if self.auxiliary_geometry_count == 0:
+            return 0.0
+        return (
+            self.auxiliary_geometry_mode_correct_count
+            / self.auxiliary_geometry_count
+        )
+
+    @property
+    def auxiliary_oriented_box_iou(self) -> float:
+        if self.auxiliary_geometry_count == 0:
+            return 0.0
+        return self.auxiliary_oriented_box_iou_sum / self.auxiliary_geometry_count
+
+    @property
+    def auxiliary_angle_mae(self) -> float:
+        if self.auxiliary_geometry_count == 0:
+            return 0.0
+        return (
+            self.auxiliary_angle_absolute_error_sum
+            / self.auxiliary_geometry_count
+        )
+
+    @property
+    def auxiliary_bezier_centerline_error(self) -> float:
+        if self.auxiliary_bezier_count == 0:
+            return 0.0
+        return (
+            self.auxiliary_bezier_centerline_error_sum
+            / self.auxiliary_bezier_count
+        )
+
+    @property
+    def generation_latency_seconds(self) -> float:
+        if self.generation_latency_count == 0:
+            return 0.0
+        return self.generation_latency_seconds_sum / self.generation_latency_count
 
     @property
     def box_iou(self) -> float:
@@ -139,6 +265,14 @@ class GenerationValidityMetrics:
                     "generation/bezier_coordinate_count": self.bezier_coordinate_count,
                     "generation/color_mae": self.color_mae,
                     "generation/color_channel_count": self.color_channel_count,
+                    "generation/oriented_box_iou": self.oriented_box_iou,
+                    "generation/oriented_box_count": self.oriented_box_count,
+                    "generation/angle_mae": self.angle_mae,
+                    "generation/angle_count": self.angle_count,
+                    "generation/geometry_mode_accuracy": self.geometry_mode_accuracy,
+                    "generation/geometry_mode_count": self.geometry_mode_count,
+                    "generation/bezier_centerline_error": self.bezier_centerline_error,
+                    "generation/bezier_centerline_count": self.bezier_centerline_count,
                     "generation/semantic_id_precision": self.semantic_id_precision,
                     "generation/semantic_id_recall": self.semantic_id_recall,
                     "generation/semantic_id_exact_match": self.semantic_id_exact_match,
@@ -151,6 +285,77 @@ class GenerationValidityMetrics:
                     "generation/semantic_id_false_negative_count": (
                         self.semantic_id_false_negative_count
                     ),
+                }
+            )
+        if self.grounding_evaluated_count:
+            metrics.update(
+                {
+                    "generation/grounding_evaluated_count": self.grounding_evaluated_count,
+                    "generation/grounding_valid_count": self.grounding_valid_count,
+                    "generation/grounding_valid_percent": self.grounding_valid_percent,
+                }
+            )
+        if self.mask_evaluated_count:
+            image_denominator = self.mask_evaluated_count
+            instance_denominator = self.mask_target_count
+            metrics.update(
+                {
+                    "generation/mask_evaluated_count": image_denominator,
+                    "generation/mask_target_count": self.mask_target_count,
+                    "generation/mask_prediction_count": self.mask_prediction_count,
+                    "generation/mask_attached_iou": self.mask_attached_iou,
+                    "generation/mask_oracle_iou": self.mask_oracle_iou,
+                    "generation/mask_association_gap": self.mask_association_gap,
+                    "generation/mask_dice": (
+                        self.mask_dice_sum / instance_denominator
+                        if instance_denominator
+                        else 0.0
+                    ),
+                    "generation/mask_boundary_fscore": (
+                        self.mask_boundary_fscore_sum / instance_denominator
+                        if instance_denominator
+                        else 0.0
+                    ),
+                    "generation/mask_ap50": self.mask_ap50_sum / image_denominator,
+                    "generation/mask_ap75": self.mask_ap75_sum / image_denominator,
+                }
+            )
+        if self.serialized_geometry_mask_count:
+            metrics.update(
+                {
+                    "generation/serialized_geometry_mask_iou": (
+                        self.serialized_geometry_mask_iou
+                    ),
+                    "generation/serialized_geometry_mask_count": (
+                        self.serialized_geometry_mask_count
+                    ),
+                }
+            )
+        if self.auxiliary_geometry_count:
+            metrics.update(
+                {
+                    "generation/auxiliary_geometry_count": self.auxiliary_geometry_count,
+                    "generation/auxiliary_geometry_mode_accuracy": (
+                        self.auxiliary_geometry_mode_accuracy
+                    ),
+                    "generation/auxiliary_oriented_box_iou": (
+                        self.auxiliary_oriented_box_iou
+                    ),
+                    "generation/auxiliary_angle_mae": self.auxiliary_angle_mae,
+                    "generation/auxiliary_bezier_count": self.auxiliary_bezier_count,
+                    "generation/auxiliary_bezier_centerline_error": (
+                        self.auxiliary_bezier_centerline_error
+                    ),
+                }
+            )
+        metrics.update(self.grounding_slice_metrics)
+        if self.generation_latency_count:
+            metrics.update(
+                {
+                    "generation/latency_seconds_per_sample": (
+                        self.generation_latency_seconds
+                    ),
+                    "generation/peak_memory_bytes": self.peak_memory_bytes,
                 }
             )
         return metrics
@@ -266,6 +471,14 @@ def evaluate_generation_predictions(
     bezier_coordinate_count = 0
     color_absolute_error_sum = 0.0
     color_channel_count = 0
+    oriented_box_iou_sum = 0.0
+    oriented_box_count = 0
+    angle_absolute_error_sum = 0.0
+    angle_count = 0
+    geometry_mode_correct_count = 0
+    geometry_mode_count = 0
+    bezier_centerline_error_sum = 0.0
+    bezier_centerline_count = 0
 
     for output, raw_target in zip(outputs, targets, strict=True):
         target = (
@@ -317,6 +530,19 @@ def evaluate_generation_predictions(
                 target_obj.geometry.box, prediction_obj.geometry.box
             )
             if _is_text_object(target_obj) and _is_text_object(prediction_obj):
+                oriented_box_iou_sum += oriented_box_iou(
+                    target_obj.geometry, prediction_obj.geometry
+                )
+                oriented_box_count += 1
+                angle_absolute_error_sum += angle_error_degrees(
+                    target_obj.geometry.rotation_degrees,
+                    prediction_obj.geometry.rotation_degrees,
+                )
+                angle_count += 1
+                geometry_mode_correct_count += int(
+                    target_obj.geometry.mode == prediction_obj.geometry.mode
+                )
+                geometry_mode_count += 1
                 font_correct += int(
                     target_obj.style.font_id == prediction_obj.style.font_id
                 )
@@ -326,6 +552,10 @@ def evaluate_generation_predictions(
             target_baseline = getattr(target_obj.geometry, "baseline", None)
             prediction_baseline = getattr(prediction_obj.geometry, "baseline", None)
             if target_baseline is not None and prediction_baseline is not None:
+                bezier_centerline_error_sum += bezier_centerline_error(
+                    target_baseline, prediction_baseline
+                )
+                bezier_centerline_count += 1
                 for point_name in ("p0", "p1", "p2", "p3"):
                     target_point = getattr(target_baseline, point_name)
                     prediction_point = getattr(prediction_baseline, point_name)
@@ -370,5 +600,13 @@ def evaluate_generation_predictions(
         bezier_coordinate_count=bezier_coordinate_count,
         color_absolute_error_sum=color_absolute_error_sum,
         color_channel_count=color_channel_count,
+        oriented_box_iou_sum=oriented_box_iou_sum,
+        oriented_box_count=oriented_box_count,
+        angle_absolute_error_sum=angle_absolute_error_sum,
+        angle_count=angle_count,
+        geometry_mode_correct_count=geometry_mode_correct_count,
+        geometry_mode_count=geometry_mode_count,
+        bezier_centerline_error_sum=bezier_centerline_error_sum,
+        bezier_centerline_count=bezier_centerline_count,
         has_ground_truth=True,
     )

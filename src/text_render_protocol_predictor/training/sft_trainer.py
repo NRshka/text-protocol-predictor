@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader, Subset
 from ..evaluation.runner import evaluate_generation
 from .collator import ProtocolGenerationCollator
 from .prompts import ProtocolPromptTemplate
+from .sampler import MaskSourceBalancedSampler
 from .tracking import store_hydra_config
 
 
@@ -29,6 +30,62 @@ def _trainable_parameters(model: Any) -> list[torch.nn.Parameter]:
     if not parameters:
         raise ValueError("model has no trainable parameters")
     return parameters
+
+
+def _optimizer_parameter_groups(cfg: Any, model: Any) -> list[dict[str, Any]]:
+    """Build named learning-rate groups for grounded training."""
+    if not bool(getattr(cfg.grounding, "enabled", False)):
+        return [
+            {
+                "params": _trainable_parameters(model),
+                "lr": float(cfg.training.learning_rate),
+                "group_name": "default",
+            }
+        ]
+    learning_rates = cfg.grounding.learning_rates
+    groups: dict[str, list[torch.nn.Parameter]] = {
+        "auxiliary": [],
+        "tokens": [],
+        "language_lora": [],
+        "vision_lora": [],
+    }
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        lowered = name.lower()
+        if not name.startswith("backbone."):
+            group = "auxiliary"
+        elif "trainable_token" in lowered:
+            group = "tokens"
+        elif ".visual." in lowered:
+            group = "vision_lora"
+        else:
+            group = "language_lora"
+        groups[group].append(parameter)
+    result = [
+        {
+            "params": parameters,
+            "lr": float(getattr(learning_rates, group)),
+            "group_name": group,
+        }
+        for group, parameters in groups.items()
+        if parameters
+    ]
+    if not result:
+        raise ValueError("grounded model has no trainable parameter groups")
+    return result
+
+
+def _set_grounding_consistency_weight(cfg: Any, model: Any, step: int) -> None:
+    if not bool(getattr(cfg.grounding, "enabled", False)):
+        return
+    target = float(cfg.grounding.decoder.consistency_weight)
+    if str(cfg.grounding.phase) == "heads_only":
+        value = 0.0
+    else:
+        ramp_steps = int(cfg.grounding.consistency_ramp_steps)
+        value = target if ramp_steps <= 0 else target * min(1.0, step / ramp_steps)
+    model.consistency_weight = value
 
 
 def _step_scheduler_after_optimizer(
@@ -137,7 +194,9 @@ def evaluate_teacher_forced(
     accuracy_counts = torch.zeros(2, dtype=torch.float64, device=accelerator.device)
     for batch in dataloader:
         output = model(**batch)
-        gathered = accelerator.gather_for_metrics(output.loss.detach().repeat(batch["input_ids"].shape[0]))
+        gathered = accelerator.gather_for_metrics(
+            output.loss.detach().repeat(batch["input_ids"].shape[0])
+        )
         losses.append(gathered.float().cpu())
         accuracy_counts += _token_accuracy_counts(output.logits, batch["labels"])
     accuracy_counts = accelerator.reduce(accuracy_counts, reduction="sum")
@@ -179,10 +238,23 @@ def train_sft(
         step_scheduler_with_optimizer=False,
     )
     set_seed(int(cfg.training.seed), device_specific=True)
+    # Use the same deterministic source mixture for grounded experiments and
+    # their coordinate-only baselines. On legacy manifests the sole non-empty
+    # ``none`` bucket receives all weight.
+    train_sampler = MaskSourceBalancedSampler(
+        train_dataset,
+        weights={
+            "files": float(cfg.grounding.sampling_weights.files),
+            "geometry": float(cfg.grounding.sampling_weights.geometry),
+            "none": float(cfg.grounding.sampling_weights.none),
+        },
+        seed=int(cfg.training.seed),
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=int(cfg.training.per_device_batch_size),
-        shuffle=True,
+        shuffle=False,
+        sampler=train_sampler,
         collate_fn=collator,
         num_workers=int(cfg.dataset.num_workers),
         pin_memory=True,
@@ -214,8 +286,7 @@ def train_sft(
             persistent_workers=int(cfg.dataset.num_workers) > 0,
         )
     optimizer = torch.optim.AdamW(
-        _trainable_parameters(model),
-        lr=float(cfg.training.learning_rate),
+        _optimizer_parameter_groups(cfg, model),
         weight_decay=float(cfg.training.weight_decay),
     )
     scheduler = get_scheduler(
@@ -266,10 +337,17 @@ def train_sft(
     model.train()
     optimizer.zero_grad(set_to_none=True)
     while state.global_step < int(cfg.training.max_steps):
+        if hasattr(train_loader, "set_epoch"):
+            train_loader.set_epoch(state.epoch)
         active_loader = train_loader
         if state.batch_in_epoch:
             active_loader = accelerator.skip_first_batches(train_loader, state.batch_in_epoch)
         for batch_index, batch in enumerate(active_loader, start=state.batch_in_epoch):
+            _set_grounding_consistency_weight(
+                cfg,
+                accelerator.unwrap_model(model),
+                state.global_step,
+            )
             with accelerator.accumulate(model):
                 output = model(**batch)
                 loss = output.loss
@@ -314,15 +392,27 @@ def train_sft(
                 lr=f"{learning_rate:.3e}",
                 refresh=True,
             )
-            accelerator.log(
-                {
-                    "train/loss": mean_loss,
-                    "train/token_accuracy": train_token_accuracy,
-                    "train/learning_rate": learning_rate,
-                    "train/epoch": state.epoch,
-                },
-                step=state.global_step,
-            )
+            train_metrics = {
+                "train/loss": mean_loss,
+                "train/token_accuracy": train_token_accuracy,
+                "train/learning_rate": learning_rate,
+                "train/epoch": state.epoch,
+            }
+            if hasattr(output, "language_loss"):
+                train_metrics["train/language_loss"] = accelerator.gather(
+                    output.language_loss.detach()
+                ).float().mean().item()
+            for component, component_loss in getattr(
+                output, "loss_components", {}
+            ).items():
+                train_metrics[f"train/{component}_loss"] = accelerator.gather(
+                    component_loss.detach()
+                ).float().mean().item()
+            if bool(getattr(cfg.grounding, "enabled", False)):
+                train_metrics["train/consistency_weight"] = float(
+                    accelerator.unwrap_model(model).consistency_weight
+                )
+            accelerator.log(train_metrics, step=state.global_step)
             if state.global_step % int(cfg.training.eval_steps) == 0:
                 validation_loss, validation_token_accuracy = evaluate_teacher_forced(
                     accelerator, model, validation_loader
@@ -341,6 +431,8 @@ def train_sft(
                         progress_bar=bool(cfg.training.progress_bar),
                         coordinate_codec=prompt_template.coordinate_codec,
                         decimal_places=int(cfg.protocol.decimal_places),
+                        grounding_enabled=bool(cfg.grounding.enabled),
+                        prompt_template=prompt_template,
                     )
                     evaluation_metrics.update(validity.as_log_dict())
                 accelerator.log(evaluation_metrics, step=state.global_step)

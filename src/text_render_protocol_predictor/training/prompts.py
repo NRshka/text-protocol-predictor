@@ -11,10 +11,11 @@ from ..protocol.coordinate_tokens import CoordinateTokenCodec
 
 @dataclass(frozen=True)
 class ProtocolPromptTemplate:
-    version: str = "1.1.0"
+    version: str = "1.2.0"
     system: str = "You extract editable text rendering protocols from images."
     coordinate_codec: CoordinateTokenCodec | None = None
     text_only: bool = False
+    grounding_enabled: bool = False
 
     def user_text(
         self,
@@ -51,6 +52,12 @@ class ProtocolPromptTemplate:
                 "values by canvas height. Font sizes and all other numeric fields must use "
                 "their original units.\n"
             )
+        grounding_instruction = (
+            'For every text object, emit exactly "mask_ref":"<MASK>" immediately '
+            'after "direction" and before "geometry". Do not emit mask_ref for shapes.\n'
+            if self.grounding_enabled
+            else ""
+        )
         return (
             f"Extract all visible {object_description} from the image and return their editable "
             "rendering protocol.\n"
@@ -59,6 +66,7 @@ class ProtocolPromptTemplate:
             f"{shape_instruction}"
             f"Canvas size: {width} x {height}.\n"
             f"{coordinate_instruction}"
+            f"{grounding_instruction}"
             "Do not include explanations or Markdown."
         )
 

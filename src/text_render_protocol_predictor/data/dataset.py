@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Collection
+from typing import Collection, Literal
 
 from PIL import Image
 
+from .instance_masks import rasterize_protocol_instance_masks, validate_mask_file
 from .manifest import ManifestEntry, load_manifest, resolve_dataset_path
 from .structural_noise import (
     StructuralNoiseConfig,
@@ -16,8 +17,15 @@ from .structural_noise import (
 )
 from ..protocol.canonicalizer import canonicalize
 from ..protocol.coordinate_tokens import CoordinateTokenCodec
+from ..protocol.grounding import ground_protocol_json
 from ..protocol.schema import DatasetProtocol
 from ..protocol.validator import validate_dataset_protocol
+
+
+@dataclass(frozen=True)
+class InstanceMaskSupervision:
+    source: Literal["files", "geometry"]
+    object_paths: dict[str, Path]
 
 
 @dataclass(frozen=True)
@@ -31,6 +39,9 @@ class ProtocolDatasetRecord:
     purpose: str
     protocol: DatasetProtocol
     canonical_protocol: str
+    grounded_protocol: str
+    text_object_ids: tuple[str, ...]
+    mask_supervision: InstanceMaskSupervision | None
     seed: int
 
 
@@ -50,6 +61,7 @@ class ProtocolManifestDataset:
         structural_noise: StructuralNoiseConfig | None = None,
         coordinate_codec: CoordinateTokenCodec | None = None,
         text_only_targets: bool = False,
+        grounding_enabled: bool = False,
     ) -> None:
         self.dataset_root = Path(dataset_root).expanduser().resolve()
         manifest = Path(manifest_path)
@@ -66,6 +78,7 @@ class ProtocolManifestDataset:
         self.structural_noise = structural_noise or StructuralNoiseConfig()
         self.coordinate_codec = coordinate_codec
         self.text_only_targets = text_only_targets
+        self.grounding_enabled = grounding_enabled
 
     def __len__(self) -> int:
         return len(self.entries)
@@ -122,6 +135,21 @@ class ProtocolManifestDataset:
                 decimal_places=self.decimal_places,
                 text_only=self.text_only_targets,
             )
+        grounded_protocol = (
+            ground_protocol_json(canonical_protocol)
+            if self.grounding_enabled
+            else canonical_protocol
+        )
+        text_objects = tuple(
+            obj
+            for obj in sorted(protocol.objects, key=lambda obj: (obj.z_order, obj.id))
+            if hasattr(obj, "text")
+        )
+        mask_supervision = self._resolve_mask_supervision(
+            entry,
+            protocol,
+            text_object_ids={obj.id for obj in text_objects},
+        )
         return ProtocolDatasetRecord(
             sample_id=entry.sample_id,
             image_path=image_path,
@@ -132,8 +160,66 @@ class ProtocolManifestDataset:
             purpose=getattr(protocol, "purpose", "render"),
             protocol=protocol,
             canonical_protocol=canonical_protocol,
+            grounded_protocol=grounded_protocol,
+            text_object_ids=tuple(obj.id for obj in text_objects),
+            mask_supervision=mask_supervision,
             seed=protocol.seed,
         )
+
+    def _resolve_mask_supervision(
+        self,
+        entry: ManifestEntry,
+        protocol: DatasetProtocol,
+        *,
+        text_object_ids: set[str],
+    ) -> InstanceMaskSupervision | None:
+        declared = entry.mask_supervision
+        if declared is None:
+            return None
+        if declared.source == "geometry":
+            if not text_object_ids:
+                raise ValueError(
+                    f"sample {entry.sample_id!r} requests geometry mask supervision "
+                    "but has no target text objects"
+                )
+            empty_ids = [
+                object_id
+                for object_id, mask in rasterize_protocol_instance_masks(protocol).items()
+                if mask.getbbox() is None
+            ]
+            if empty_ids:
+                raise ValueError(
+                    f"sample {entry.sample_id!r} has geometry-derived masks with no "
+                    f"on-canvas foreground: {', '.join(empty_ids)}"
+                )
+            return InstanceMaskSupervision(source="geometry", object_paths={})
+
+        unknown_ids = sorted(set(declared.objects) - text_object_ids)
+        if unknown_ids:
+            raise ValueError(
+                f"sample {entry.sample_id!r} has masks for unknown or non-text objects: "
+                f"{', '.join(unknown_ids)}"
+            )
+        object_paths: dict[str, Path] = {}
+        for object_id, relative_path in declared.objects.items():
+            relative_manifest_root = self.entry_root.relative_to(self.dataset_root)
+            path = resolve_dataset_path(
+                self.dataset_root,
+                str(relative_manifest_root / relative_path),
+            )
+            if self.require_files and not path.is_file():
+                raise FileNotFoundError(f"instance mask does not exist: {path}")
+            if path.is_file():
+                validate_mask_file(
+                    path,
+                    expected_size=(protocol.canvas.width, protocol.canvas.height),
+                )
+            object_paths[object_id] = path
+        if len(set(object_paths.values())) != len(object_paths):
+            raise ValueError(
+                f"sample {entry.sample_id!r} assigns one mask file to multiple objects"
+            )
+        return InstanceMaskSupervision(source="files", object_paths=object_paths)
 
     @staticmethod
     def _validate_envelope(entry: ManifestEntry, protocol: DatasetProtocol) -> None:

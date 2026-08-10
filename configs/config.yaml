@@ -68,6 +68,39 @@ lora:
   dropout: 0.05
   target_scope: language_decoder
 
+grounding:
+  enabled: false
+  # heads_only trains decoder heads and selective vocabulary rows; joint also
+  # trains the configured LoRA adapter. Phase two loads a grounded phase-one
+  # export through model.weights_path with fresh optimizer state.
+  phase: joint
+  sampling_weights:
+    files: 0.4
+    geometry: 0.4
+    none: 0.2
+  learning_rates:
+    auxiliary: 2.0e-4
+    tokens: 1.0e-4
+    language_lora: 1.0e-4
+    vision_lora: 2.0e-5
+  consistency_ramp_steps: 500
+  vision_lora:
+    enabled: false
+    final_blocks: 6
+  decoder:
+    feature_layers: [8, 16, 24, 26]
+    feature_projection_dim: 128
+    pixel_embedding_dim: 256
+    query_hidden_dim: 1024
+    output_stride: 4
+    bezier_samples: 32
+    mask_bce_weight: 1.0
+    mask_dice_weight: 1.0
+    geometry_weight: 0.5
+    consistency_weight: 0.25
+    quality_weight: 0.1
+    positive_weight_max: 20.0
+
 training:
   seed: 2026
   per_device_batch_size: 1

@@ -4,7 +4,11 @@ from types import SimpleNamespace
 
 import torch
 
-from text_render_protocol_predictor.training import ProtocolPromptTemplate, ProtocolSFTCollator
+from text_render_protocol_predictor.training import (
+    ProtocolPromptTemplate,
+    ProtocolSFTCollator,
+    locate_completion_token_positions,
+)
 
 
 class FakeProcessor:
@@ -78,3 +82,18 @@ def test_collator_enforces_output_token_limit() -> None:
         assert "assistant target length" in str(exc)
     else:
         raise AssertionError("expected assistant target to exceed the output limit")
+
+
+def test_mask_token_locator_excludes_same_token_in_prompt() -> None:
+    full = {
+        "input_ids": torch.tensor([[1, 99, 2, 99, 3]]),
+        "attention_mask": torch.ones((1, 5), dtype=torch.long),
+    }
+    prompt = {
+        "input_ids": torch.tensor([[1, 99, 2]]),
+        "attention_mask": torch.ones((1, 3), dtype=torch.long),
+    }
+
+    positions = locate_completion_token_positions(full, prompt, token_id=99)
+
+    assert positions[0].tolist() == [3]

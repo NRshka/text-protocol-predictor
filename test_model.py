@@ -5,15 +5,28 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 from torch.utils.data import DataLoader, Subset
-from tqdm.auto import tqdm
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
 from src.text_render_protocol_predictor.data import ProtocolManifestDataset
-from src.text_render_protocol_predictor.evaluation import evaluate_generation_predictions
-from src.text_render_protocol_predictor.models.qwen3_vl import inspect_peft_weights_directory
+from src.text_render_protocol_predictor.evaluation.runner import evaluate_generation
+from src.text_render_protocol_predictor.models.grounded_qwen3_vl import (
+    GROUNDING_CONFIG_FILE,
+    GROUNDING_WEIGHTS_FILE,
+    GroundedQwen3VL,
+    load_grounding_config,
+)
+from src.text_render_protocol_predictor.models.qwen3_vl import (
+    inspect_peft_weights_directory,
+    resize_model_to_tokenizer_vocabulary,
+)
+from src.text_render_protocol_predictor.protocol import (
+    MASK_TOKENIZER_SURFACE,
+    CoordinateTokenCodec,
+)
 from src.text_render_protocol_predictor.training import (
     ProtocolGenerationCollator,
     ProtocolPromptTemplate,
@@ -41,6 +54,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decimal-places", type=int, default=3)
     parser.add_argument("--max-objects", type=int, default=64)
     parser.add_argument("--attn-implementation", default="sdpa")
+    parser.add_argument(
+        "--text-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Evaluate text objects only (default: true)",
+    )
+    parser.add_argument(
+        "--coordinate-encoding",
+        choices=("auto", "enabled", "disabled"),
+        default="auto",
+    )
+    parser.add_argument("--coordinate-bins", type=int, default=512)
+    parser.add_argument("--coordinate-token-prefix", default="coord")
     parser.add_argument(
         "--no-verify-image-dimensions",
         action="store_false",
@@ -78,6 +104,10 @@ def print_metrics(metrics: object) -> None:
         ("wer", metrics.word_error_rate),
         ("cer", metrics.character_error_rate),
         ("box_iou", metrics.box_iou),
+        ("oriented_box_iou", metrics.oriented_box_iou),
+        ("angle_mae", metrics.angle_mae),
+        ("geometry_mode_accuracy", metrics.geometry_mode_accuracy),
+        ("bezier_centerline_error", metrics.bezier_centerline_error),
         ("bezier_mse", metrics.bezier_mse),
         ("color_mae", metrics.color_mae),
     )
@@ -88,37 +118,115 @@ def print_metrics(metrics: object) -> None:
     print(f"schema_valid: {metrics.schema_valid_count}/{metrics.evaluated_count}")
     print(f"bezier_coordinates_compared: {metrics.bezier_coordinate_count}")
     print(f"color_channels_compared: {metrics.color_channel_count}")
+    if metrics.grounding_evaluated_count:
+        print(
+            "grounding_valid: "
+            f"{metrics.grounding_valid_count}/{metrics.grounding_evaluated_count}"
+        )
+    if metrics.mask_evaluated_count:
+        print(f"mask_attached_iou: {metrics.mask_attached_iou:.6f}")
+        print(f"mask_oracle_iou: {metrics.mask_oracle_iou:.6f}")
+        print(f"mask_association_gap: {metrics.mask_association_gap:.6f}")
+        logged = metrics.as_log_dict()
+        for name in (
+            "generation/mask_dice",
+            "generation/mask_boundary_fscore",
+            "generation/mask_ap50",
+            "generation/mask_ap75",
+            "generation/serialized_geometry_mask_iou",
+            "generation/auxiliary_geometry_mode_accuracy",
+            "generation/auxiliary_oriented_box_iou",
+            "generation/auxiliary_angle_mae",
+            "generation/auxiliary_bezier_centerline_error",
+        ):
+            if name in logged:
+                print(f"{name.removeprefix('generation/')}: {logged[name]:.6f}")
+        for name, value in sorted(logged.items()):
+            if name.startswith("generation/slice/"):
+                print(f"{name.removeprefix('generation/')}: {value}")
+
+
+def _device_batches(dataloader: DataLoader, device: str):
+    for batch in dataloader:
+        yield {
+            name: value.to(device, non_blocking=True)
+            if isinstance(value, torch.Tensor)
+            else value
+            for name, value in batch.items()
+        }
 
 
 def main() -> None:
     args = parse_args()
     validate_args(args)
     weights_path, base_model = inspect_peft_weights_directory(args.weights)
+    processor = AutoProcessor.from_pretrained(
+        str(weights_path),
+        min_pixels=args.image_min_pixels,
+        max_pixels=args.image_max_pixels,
+    )
+    coordinate_codec: CoordinateTokenCodec | None = None
+    if args.coordinate_encoding != "disabled":
+        candidate = CoordinateTokenCodec(
+            bins=args.coordinate_bins,
+            prefix=args.coordinate_token_prefix,
+        )
+        present = sum(
+            token in processor.tokenizer.get_vocab()
+            for token in candidate.tokenizer_tokens
+        )
+        if present == candidate.bins:
+            coordinate_codec = candidate
+        elif present or args.coordinate_encoding == "enabled":
+            raise ValueError(
+                f"checkpoint tokenizer contains {present}/{candidate.bins} configured "
+                "coordinate tokens"
+            )
+    grounding_files = (
+        weights_path / GROUNDING_CONFIG_FILE,
+        weights_path / GROUNDING_WEIGHTS_FILE,
+    )
+    present_grounding = [path.is_file() for path in grounding_files]
+    if any(present_grounding) and not all(present_grounding):
+        raise ValueError("grounded checkpoint export is incomplete")
+    grounded = all(present_grounding)
     dataset = ProtocolManifestDataset(
         dataset_root=args.dataset_root,
         manifest_path=args.manifest,
         decimal_places=args.decimal_places,
         verify_image_dimensions=args.verify_image_dimensions,
         max_objects=args.max_objects,
+        coordinate_codec=coordinate_codec,
+        text_only_targets=args.text_only,
+        grounding_enabled=grounded,
     )
     if args.max_samples is not None:
         dataset = Subset(dataset, range(min(args.max_samples, len(dataset))))
     if len(dataset) == 0:
         raise ValueError("the selected test dataset is empty")
 
-    processor = AutoProcessor.from_pretrained(
-        str(weights_path),
-        min_pixels=args.image_min_pixels,
-        max_pixels=args.image_max_pixels,
-    )
     model = Qwen3VLForConditionalGeneration.from_pretrained(
         base_model,
         dtype=resolve_dtype(args.dtype, args.device),
         attn_implementation=args.attn_implementation,
     )
+    resize_model_to_tokenizer_vocabulary(model, processor.tokenizer)
     from peft import PeftModel
 
     model = PeftModel.from_pretrained(model, str(weights_path), is_trainable=False)
+    if grounded:
+        decoder_config, mask_token_id = load_grounding_config(weights_path)
+        if processor.tokenizer.encode(
+            MASK_TOKENIZER_SURFACE,
+            add_special_tokens=False,
+        ) != [mask_token_id]:
+            raise ValueError("grounded checkpoint tokenizer has an invalid mask token")
+        model = GroundedQwen3VL(
+            model,
+            mask_token_id=mask_token_id,
+            decoder_config=decoder_config,
+        )
+        model.load_grounding_pretrained(weights_path)
     model.to(args.device).eval()
     model.config.use_cache = True
 
@@ -128,51 +236,44 @@ def main() -> None:
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=args.device.startswith("cuda"),
-        collate_fn=ProtocolGenerationCollator(processor, ProtocolPromptTemplate()),
+        collate_fn=ProtocolGenerationCollator(
+            processor,
+            ProtocolPromptTemplate(
+                coordinate_codec=coordinate_codec,
+                text_only=args.text_only,
+                grounding_enabled=grounded,
+            ),
+        ),
     )
-    sample_ids: list[str] = []
-    outputs: list[str] = []
-    targets: list[str] = []
-    with torch.inference_mode():
-        for batch in tqdm(dataloader, desc="Testing", unit="batch", dynamic_ncols=True):
-            sample_ids.extend(batch.pop("_sample_ids"))
-            targets.extend(batch.pop("_targets"))
-            model_batch = {
-                name: value.to(args.device, non_blocking=True)
-                if isinstance(value, torch.Tensor)
-                else value
-                for name, value in batch.items()
-            }
-            input_length = model_batch["input_ids"].shape[1]
-            generated = model.generate(
-                **model_batch,
-                do_sample=False,
-                max_new_tokens=args.max_new_tokens,
-                use_cache=True,
-            )
-            outputs.extend(
-                processor.batch_decode(
-                    generated[:, input_length:],
-                    skip_special_tokens=True,
-                    clean_up_tokenization_spaces=False,
-                )
-            )
-
-    metrics = evaluate_generation_predictions(outputs, targets)
+    prediction_rows: list[dict[str, str]] = []
+    prompt_template = ProtocolPromptTemplate(
+        coordinate_codec=coordinate_codec,
+        text_only=args.text_only,
+        grounding_enabled=grounded,
+    )
+    metrics = evaluate_generation(
+        accelerator=SimpleNamespace(
+            device=torch.device(args.device),
+            is_local_main_process=True,
+            num_processes=1,
+            unwrap_model=lambda value: value,
+        ),
+        model=model,
+        processor=processor,
+        dataloader=_device_batches(dataloader, args.device),
+        max_new_tokens=args.max_new_tokens,
+        coordinate_codec=coordinate_codec,
+        decimal_places=args.decimal_places,
+        grounding_enabled=grounded,
+        prompt_template=prompt_template,
+        prediction_sink=prediction_rows,
+    )
     print_metrics(metrics)
     if args.predictions_output is not None:
         args.predictions_output.parent.mkdir(parents=True, exist_ok=True)
         with args.predictions_output.open("w", encoding="utf-8") as stream:
-            for sample_id, prediction, target in zip(
-                sample_ids, outputs, targets, strict=True
-            ):
-                stream.write(
-                    json.dumps(
-                        {"sample_id": sample_id, "prediction": prediction, "target": target},
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
+            for row in prediction_rows:
+                stream.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 if __name__ == "__main__":

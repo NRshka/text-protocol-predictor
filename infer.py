@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
@@ -15,8 +16,21 @@ from src.text_render_protocol_predictor.models.qwen3_vl import (
     inspect_peft_weights_directory,
     resize_model_to_tokenizer_vocabulary,
 )
-from src.text_render_protocol_predictor.protocol import CoordinateTokenCodec
-from src.text_render_protocol_predictor.training import ProtocolPromptTemplate
+from src.text_render_protocol_predictor.models.grounded_qwen3_vl import (
+    GROUNDING_CONFIG_FILE,
+    GROUNDING_WEIGHTS_FILE,
+    GroundedQwen3VL,
+    load_grounding_config,
+)
+from src.text_render_protocol_predictor.protocol import (
+    MASK_TOKENIZER_SURFACE,
+    CoordinateTokenCodec,
+    strip_mask_references,
+)
+from src.text_render_protocol_predictor.training import (
+    ProtocolPromptTemplate,
+    locate_completion_token_positions,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,6 +57,11 @@ def parse_args() -> argparse.Namespace:
         "--raw-output",
         type=Path,
         help="Optionally save the native model generation before coordinate decoding",
+    )
+    parser.add_argument(
+        "--mask-output-dir",
+        type=Path,
+        help="Decode grounded instance masks into PNG files and manifest.json",
     )
     parser.add_argument(
         "--coordinate-encoding",
@@ -126,6 +145,142 @@ def write_prediction(path: Path, output: str) -> None:
     )
 
 
+def is_grounded_checkpoint(weights_path: Path | None) -> bool:
+    """Detect a complete grounding export and reject partial/corrupt exports."""
+    if weights_path is None:
+        return False
+    grounding_files = (
+        weights_path / GROUNDING_CONFIG_FILE,
+        weights_path / GROUNDING_WEIGHTS_FILE,
+    )
+    present = [path.is_file() for path in grounding_files]
+    if any(present) and not all(present):
+        missing = [path.name for path, exists in zip(grounding_files, present) if not exists]
+        raise ValueError(
+            "grounded checkpoint is incomplete; missing: " + ", ".join(missing)
+        )
+    return all(present)
+
+
+def write_mask_sidecar(
+    output_dir: Path,
+    *,
+    status: str,
+    canvas_size: tuple[int, int],
+    instances: list[dict] | None = None,
+    error: str | None = None,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "schema_version": "1.0",
+        "status": status,
+        "canvas": {"width": canvas_size[0], "height": canvas_size[1]},
+        "threshold": 0.5,
+        "instances": instances or [],
+        "error": error,
+    }
+    (output_dir / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _tensor_probability_image(value: torch.Tensor) -> Image.Image:
+    encoded = value.detach().float().clamp(0, 1).mul(255).round().to(torch.uint8).cpu()
+    height, width = encoded.shape
+    return Image.frombytes("L", (width, height), encoded.contiguous().numpy().tobytes())
+
+
+def decode_and_write_masks(
+    *,
+    model: GroundedQwen3VL,
+    processor: object,
+    prompt_template: ProtocolPromptTemplate,
+    image_path: Path,
+    raw_output: str,
+    object_ids: tuple[str, ...],
+    canvas_size: tuple[int, int],
+    protocol_version: str,
+    device: str,
+    output_dir: Path,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    conversation = prompt_template.conversation(
+        image=image_path,
+        width=canvas_size[0],
+        height=canvas_size[1],
+        protocol_version=protocol_version,
+        target=raw_output,
+    )
+    full_batch = processor.apply_chat_template(
+        [conversation],
+        tokenize=True,
+        add_generation_prompt=False,
+        return_dict=True,
+        return_tensors="pt",
+        processor_kwargs={"padding": True},
+    ).to(device)
+    prompt_conversation = prompt_template.conversation(
+        image=image_path,
+        width=canvas_size[0],
+        height=canvas_size[1],
+        protocol_version=protocol_version,
+    )
+    prompt_batch = processor.apply_chat_template(
+        [prompt_conversation],
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+        return_tensors="pt",
+        processor_kwargs={"padding": True},
+    ).to(device)
+    token_positions = locate_completion_token_positions(
+        full_batch,
+        prompt_batch,
+        token_id=model.mask_token_id,
+    )[0]
+    if len(token_positions) != len(object_ids):
+        raise ValueError(
+            f"generated completion contains {len(token_positions)} atomic mask tokens "
+            f"for {len(object_ids)} text objects"
+        )
+    positions = token_positions.unsqueeze(0)
+    valid = torch.ones_like(positions, dtype=torch.bool)
+    with torch.inference_mode():
+        result = model(
+            **full_batch,
+            mask_token_positions=positions,
+            instance_valid=valid,
+        )
+    logits = result.mask_logits[0]
+    qualities = result.geometry_predictions[0]["quality_logits"].sigmoid()
+    resized = F.interpolate(
+        logits.sigmoid().unsqueeze(1),
+        size=(canvas_size[1], canvas_size[0]),
+        mode="bilinear",
+        align_corners=False,
+    ).squeeze(1)
+    instances: list[dict] = []
+    for index, (object_id, probability, quality) in enumerate(
+        zip(object_ids, resized, qualities, strict=True)
+    ):
+        filename = f"{index:04d}-{object_id}.png"
+        _tensor_probability_image(probability).save(output_dir / filename)
+        instances.append(
+            {
+                "object_id": object_id,
+                "mask": filename,
+                "quality_score": float(quality.item()),
+            }
+        )
+    write_mask_sidecar(
+        output_dir,
+        status="ok",
+        canvas_size=canvas_size,
+        instances=instances,
+    )
+
+
 def main() -> None:
     args = parse_args()
     if not args.image.is_file():
@@ -160,15 +315,33 @@ def main() -> None:
         from peft import PeftModel
 
         model = PeftModel.from_pretrained(model, str(weights_path), is_trainable=False)
+    grounded = is_grounded_checkpoint(weights_path)
+    if args.mask_output_dir is not None and not grounded:
+        raise ValueError("--mask-output-dir requires a grounded checkpoint")
+    if grounded:
+        decoder_config, saved_mask_token_id = load_grounding_config(weights_path)
+        token_ids = processor.tokenizer.encode(
+            MASK_TOKENIZER_SURFACE, add_special_tokens=False
+        )
+        if token_ids != [saved_mask_token_id]:
+            raise ValueError("grounded checkpoint tokenizer has an invalid mask token")
+        model = GroundedQwen3VL(
+            model,
+            mask_token_id=saved_mask_token_id,
+            decoder_config=decoder_config,
+        )
+        model.load_grounding_pretrained(weights_path)
     model.to(args.device).eval()
     model.config.use_cache = True
 
     with Image.open(args.image) as image:
         width, height = image.size
-    conversation = ProtocolPromptTemplate(
+    prompt_template = ProtocolPromptTemplate(
         coordinate_codec=coordinate_codec,
         text_only=args.text_only,
-    ).conversation(
+        grounding_enabled=grounded,
+    )
+    conversation = prompt_template.conversation(
         image=args.image,
         width=width,
         height=height,
@@ -185,6 +358,7 @@ def main() -> None:
 
     if args.device.startswith("cuda"):
         torch.cuda.synchronize(args.device)
+        torch.cuda.reset_peak_memory_stats(args.device)
     generation_started_at = time.perf_counter()
     with torch.inference_mode():
         generated = model.generate(
@@ -196,14 +370,30 @@ def main() -> None:
     if args.device.startswith("cuda"):
         torch.cuda.synchronize(args.device)
     generation_latency_seconds = time.perf_counter() - generation_started_at
+    peak_memory_bytes = (
+        int(torch.cuda.max_memory_allocated(args.device))
+        if args.device.startswith("cuda")
+        else 0
+    )
     completion = generated[:, batch["input_ids"].shape[1] :]
     raw_output = processor.batch_decode(
         completion,
         skip_special_tokens=True,
         clean_up_tokenization_spaces=False,
     )[0]
+    grounding_result = None
+    native_clean_output = raw_output
+    grounding_error = None
+    if grounded:
+        try:
+            grounding_result = strip_mask_references(raw_output)
+            native_clean_output = grounding_result.clean_json
+            if not grounding_result.valid:
+                grounding_error = "; ".join(grounding_result.errors)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            grounding_error = str(exc)
     output, coordinate_decode_error = decode_prediction_coordinates(
-        raw_output,
+        native_clean_output,
         coordinate_codec,
         image_size=(width, height),
     )
@@ -213,7 +403,8 @@ def main() -> None:
         f"valid_json={bool(metrics.valid_json_count)} "
         f"schema_valid={bool(metrics.schema_valid_count)} "
         f"generated_tokens={completion.shape[1]} "
-        f"generation_latency_seconds={generation_latency_seconds:.3f}",
+        f"generation_latency_seconds={generation_latency_seconds:.3f} "
+        f"peak_memory_bytes={peak_memory_bytes}",
         file=sys.stderr,
     )
     if coordinate_decode_error is not None:
@@ -223,6 +414,32 @@ def main() -> None:
         )
     if args.raw_output:
         write_prediction(args.raw_output, raw_output)
+    if args.mask_output_dir is not None:
+        try:
+            if grounding_result is None or not grounding_result.valid:
+                raise ValueError(grounding_error or "generated grounding is invalid")
+            if not metrics.schema_valid_count:
+                raise ValueError("clean generated STRP is schema-invalid")
+            decode_and_write_masks(
+                model=model,
+                processor=processor,
+                prompt_template=prompt_template,
+                image_path=args.image,
+                raw_output=raw_output,
+                object_ids=grounding_result.object_ids,
+                canvas_size=(width, height),
+                protocol_version=args.protocol_version,
+                device=args.device,
+                output_dir=args.mask_output_dir,
+            )
+        except Exception as exc:
+            write_mask_sidecar(
+                args.mask_output_dir,
+                status="error",
+                canvas_size=(width, height),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            print(f"mask_decode_error={type(exc).__name__}: {exc}", file=sys.stderr)
     if args.output:
         write_prediction(args.output, output)
     if args.pretty and metrics.valid_json_count:

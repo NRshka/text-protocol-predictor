@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
-from typing import Any
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageFilter
+
+from ..data.instance_masks import rasterize_text_slot_mask
 
 
 @dataclass(frozen=True)
@@ -49,82 +49,27 @@ def dilate_layout_mask(
     return np.asarray(result, dtype=np.uint8) > 0
 
 
-def _paste_rotated_box(canvas: Image.Image, geometry: Any) -> None:
-    box = geometry.box
-    width = max(1, math.ceil(float(box.width)))
-    height = max(1, math.ceil(float(box.height)))
-    local = Image.new("L", (width, height), 255)
-    rotation = float(geometry.rotation_degrees)
-    if rotation:
-        # STRP angles are clockwise; Pillow's positive angles are counter-clockwise.
-        local = local.rotate(-rotation, resample=Image.Resampling.NEAREST, expand=True)
-    center_x = float(box.x) + float(box.width) / 2
-    center_y = float(box.y) + float(box.height) / 2
-    left = round(center_x - local.width / 2)
-    top = round(center_y - local.height / 2)
-    canvas.paste(255, (left, top), local)
-
-
-def _bezier_points(baseline: Any, samples: int) -> list[tuple[float, float]]:
-    points = (baseline.p0, baseline.p1, baseline.p2, baseline.p3)
-    result: list[tuple[float, float]] = []
-    for index in range(samples):
-        t = index / (samples - 1)
-        one_minus_t = 1.0 - t
-        coefficients = (
-            one_minus_t**3,
-            3 * one_minus_t**2 * t,
-            3 * one_minus_t * t**2,
-            t**3,
-        )
-        result.append(
-            (
-                sum(
-                    coefficient * float(point.x)
-                    for coefficient, point in zip(coefficients, points, strict=True)
-                ),
-                sum(
-                    coefficient * float(point.y)
-                    for coefficient, point in zip(coefficients, points, strict=True)
-                ),
-            )
-        )
-    return result
-
-
-def _draw_bezier_band(canvas: Image.Image, geometry: Any, *, samples: int) -> None:
-    baseline = geometry.baseline
-    if baseline is None:
-        return
-    points = _bezier_points(baseline, samples)
-    width = max(1, round(float(geometry.box.height)))
-    draw = ImageDraw.Draw(canvas)
-    draw.line(points, fill=255, width=width, joint="curve")
-    radius = width / 2
-    for x, y in (points[0], points[-1]):
-        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=255)
-
-
 def rasterize_protocol_layout_mask(
-    prediction: Any,
+    prediction: object,
     *,
     canvas_size: tuple[int, int],
     bezier_samples: int = 129,
 ) -> np.ndarray:
     """Rasterize the union of text boxes and curved baseline bands."""
-    if bezier_samples < 2:
-        raise ValueError("bezier_samples must be at least two")
-    canvas = Image.new("L", canvas_size, 0)
+    if bezier_samples < 129:
+        raise ValueError("bezier_samples must be at least 129")
+    union = np.zeros((canvas_size[1], canvas_size[0]), dtype=bool)
     for obj in prediction.objects:
         # Protocol 2.x can include shapes; layout reward concerns text only.
         if not hasattr(obj, "text"):
             continue
-        geometry = obj.geometry
-        if geometry.mode == "bezier":
-            _draw_bezier_band(canvas, geometry, samples=bezier_samples)
-        else:
-            _paste_rotated_box(canvas, geometry)
-    return np.asarray(canvas, dtype=np.uint8) > 0
+        instance = rasterize_text_slot_mask(
+            obj,
+            canvas_size=canvas_size,
+            bezier_samples=bezier_samples,
+        )
+        union |= np.asarray(instance, dtype=np.uint8) > 0
+    return union
 
 
 def calculate_layout_mask_metrics(

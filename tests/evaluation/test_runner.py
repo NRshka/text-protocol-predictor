@@ -51,6 +51,7 @@ def test_generation_evaluation_reports_batch_progress(monkeypatch, protocol_dict
         }
     ]
 
+    predictions = []
     metrics = evaluate_generation(
         accelerator=accelerator,
         model=model,
@@ -59,6 +60,7 @@ def test_generation_evaluation_reports_batch_progress(monkeypatch, protocol_dict
         max_new_tokens=8,
         progress_bar=True,
         coordinate_codec=coordinate_codec,
+        prediction_sink=predictions,
     )
 
     assert progress_args["desc"] == "Generation evaluation"
@@ -69,4 +71,10 @@ def test_generation_evaluation_reports_batch_progress(monkeypatch, protocol_dict
     assert metrics.ground_truth_object_count == 2
     assert metrics.box_iou == 1.0
     assert metrics.semantic_id_exact_match == 1.0
+    assert metrics.generation_latency_count == 1
+    assert metrics.generation_latency_seconds > 0
+    assert metrics.peak_memory_bytes == 0
+    assert predictions == [
+        {"sample_id": "sample-1", "prediction": target, "target": target}
+    ]
     assert model.training is True

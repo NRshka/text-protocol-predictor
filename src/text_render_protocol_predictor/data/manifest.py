@@ -4,7 +4,30 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+class MaskSupervision(BaseModel):
+    """Optional dense supervision declared by a dataset generator."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["files", "geometry"]
+    objects: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def source_matches_objects(self) -> "MaskSupervision":
+        if self.source == "files" and not self.objects:
+            raise ValueError("files mask supervision requires at least one object path")
+        if self.source == "geometry" and self.objects:
+            raise ValueError("geometry mask supervision must not contain object paths")
+        if any(not object_id for object_id in self.objects):
+            raise ValueError("mask-supervision object IDs must be non-empty")
+        if any(not path for path in self.objects.values()):
+            raise ValueError("mask-supervision paths must be non-empty")
+        return self
 
 
 class ManifestEntry(BaseModel):
@@ -19,6 +42,7 @@ class ManifestEntry(BaseModel):
     template_id: str | None = None
     structural_groups: dict[str, str] | None = None
     annotation_status: str | None = None
+    mask_supervision: MaskSupervision | None = None
 
 
 def load_manifest(path: str | Path) -> list[ManifestEntry]:
